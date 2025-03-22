@@ -1,0 +1,23 @@
+# permissions for end users to view failovergroups.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: multicluster-failover-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: failovergroup-viewer-role
+rules:
+- apiGroups:
+  - crd.hahomelabs.com
+  resources:
+  - failovergroups
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - crd.hahomelabs.com
+  resources:
+  - failovergroups/status
+  verbs:
+  - get

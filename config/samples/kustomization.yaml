@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- crd_v1alpha1_failovergroup.yaml
+- crd_v1alpha1_failover.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
