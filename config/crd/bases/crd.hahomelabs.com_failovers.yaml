@@ -14,7 +14,20 @@ spec:
     singular: failover
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.status
+      name: Status
+      type: string
+    - jsonPath: .status.state
+      name: State
+      type: string
+    - jsonPath: .spec.targetCluster
+      name: Target
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Failover is the Schema for the failovers API
@@ -39,15 +52,219 @@ spec:
           spec:
             description: FailoverSpec defines the desired state of Failover
             properties:
-              foo:
-                description: Foo is an example field of Failover. Edit failover_types.go
-                  to remove/update
+              failoverGroups:
+                description: FailoverGroups references the FailoverGroup resources
+                  to be failed over
+                items:
+                  description: FailoverGroupReference defines a reference to a FailoverGroup
+                    resource
+                  properties:
+                    completionTime:
+                      description: CompletionTime is when the failover completed for
+                        this group
+                      type: string
+                    message:
+                      description: Message provides additional details about the failover
+                        operation
+                      type: string
+                    name:
+                      description: Name of the FailoverGroup
+                      type: string
+                    namespace:
+                      description: |-
+                        Namespace of the FailoverGroup
+                        If not provided, the Failover's namespace will be used
+                      type: string
+                    startTime:
+                      description: StartTime is when the failover started for this
+                        group
+                      type: string
+                    status:
+                      description: Status of the failover operation for this group
+                      enum:
+                      - SUCCESS
+                      - FAILED
+                      - IN_PROGRESS
+                      - PENDING
+                      type: string
+                  required:
+                  - name
+                  type: object
+                minItems: 1
+                type: array
+              failoverMode:
+                description: |-
+                  FailoverMode defines the strategy for failover process
+                  CONSISTENCY: Prioritizes data consistency by shutting down source first (previously "Safe")
+                  UPTIME: Prioritizes service uptime by activating target before deactivating source (previously "Fast")
+                enum:
+                - CONSISTENCY
+                - UPTIME
                 type: string
+              force:
+                default: false
+                description: |-
+                  When true, skips safety checks like replication lag or volume sync state
+                  Use with caution - can lead to data loss if replication isn't complete
+                type: boolean
+              reason:
+                description: |-
+                  Optional documentation field explaining the reason for this failover
+                  Not used by controller logic but useful for auditing and tracking
+                type: string
+              targetCluster:
+                description: TargetCluster specifies which cluster should become the
+                  PRIMARY
+                type: string
+            required:
+            - failoverGroups
+            - failoverMode
+            - targetCluster
             type: object
           status:
             description: FailoverStatus defines the observed state of Failover
+            properties:
+              conditions:
+                description: Conditions represent the current state of the failover
+                  operation
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              failoverGroups:
+                description: FailoverGroups contains status information for each FailoverGroup
+                items:
+                  description: FailoverGroupReference defines a reference to a FailoverGroup
+                    resource
+                  properties:
+                    completionTime:
+                      description: CompletionTime is when the failover completed for
+                        this group
+                      type: string
+                    message:
+                      description: Message provides additional details about the failover
+                        operation
+                      type: string
+                    name:
+                      description: Name of the FailoverGroup
+                      type: string
+                    namespace:
+                      description: |-
+                        Namespace of the FailoverGroup
+                        If not provided, the Failover's namespace will be used
+                      type: string
+                    startTime:
+                      description: StartTime is when the failover started for this
+                        group
+                      type: string
+                    status:
+                      description: Status of the failover operation for this group
+                      enum:
+                      - SUCCESS
+                      - FAILED
+                      - IN_PROGRESS
+                      - PENDING
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              message:
+                description: Message provides additional details about the overall
+                  failover operation
+                type: string
+              metrics:
+                description: Metrics contains metrics related to the failover operation
+                properties:
+                  totalDowntimeSeconds:
+                    description: TotalDowntimeSeconds is the total application downtime
+                      during failover
+                    format: int64
+                    type: integer
+                  totalFailoverTimeSeconds:
+                    description: TotalFailoverTimeSeconds is the total time taken
+                      to complete the failover
+                    format: int64
+                    type: integer
+                type: object
+              state:
+                description: |-
+                  State reflects the current phase of the failover workflow
+                  Values: "INITIALIZING", "SCALING_DOWN_SOURCE", "DEMOTING_VOLUMES", "PROMOTING_VOLUMES", "SCALING_UP_TARGET", "TRANSFERRING_OWNERSHIP", etc.
+                type: string
+              status:
+                description: Status of the failover operation
+                enum:
+                - SUCCESS
+                - FAILED
+                - IN_PROGRESS
+                type: string
             type: object
         type: object
+        x-kubernetes-validations:
+        - message: targetCluster is immutable
+          rule: '!has(oldSelf.spec) || oldSelf.spec.targetCluster == self.spec.targetCluster'
+        - message: failoverMode is immutable
+          rule: '!has(oldSelf.spec) || oldSelf.spec.failoverMode == self.spec.failoverMode'
+        - message: force is immutable
+          rule: '!has(oldSelf.spec) || !has(oldSelf.spec.force) && !has(self.spec.force)
+            || has(oldSelf.spec.force) && has(self.spec.force) && oldSelf.spec.force
+            == self.spec.force'
+        - message: reason is immutable
+          rule: '!has(oldSelf.spec) || oldSelf.spec.reason == self.spec.reason'
+        - message: failoverGroups are immutable
+          rule: '!has(oldSelf.spec) || oldSelf.spec.failoverGroups == self.spec.failoverGroups'
     served: true
     storage: true
     subresources:

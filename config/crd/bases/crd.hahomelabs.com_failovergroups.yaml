@@ -14,7 +14,20 @@ spec:
     singular: failovergroup
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.health
+      name: Health
+      type: string
+    - jsonPath: .status.suspended
+      name: Suspended
+      type: boolean
+    - jsonPath: .status.globalState.activeCluster
+      name: Active
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: FailoverGroup is the Schema for the failovergroups API
@@ -39,13 +52,381 @@ spec:
           spec:
             description: FailoverGroupSpec defines the desired state of FailoverGroup
             properties:
-              foo:
-                description: Foo is an example field of FailoverGroup. Edit failovergroup_types.go
-                  to remove/update
+              fluxResources:
+                description: Flux resources to manage during failover
+                items:
+                  description: FluxResourceSpec defines a Flux GitOps resource
+                  properties:
+                    kind:
+                      description: Kind of the Flux resource
+                      enum:
+                      - HelmRelease
+                      - Kustomization
+                      type: string
+                    name:
+                      description: Name of the Flux resource
+                      type: string
+                    triggerReconcile:
+                      description: Whether to trigger reconciliation of this resource
+                        during failover
+                      type: boolean
+                  required:
+                  - kind
+                  - name
+                  type: object
+                type: array
+              heartbeatInterval:
+                description: |-
+                  How often the operator updates heartbeats in DynamoDB
+                  This controls the frequency of cluster health updates in the global state
                 type: string
+              networkResources:
+                description: Network resources that just need annotation flips during
+                  failover
+                items:
+                  description: NetworkResourceSpec defines a network resource
+                  properties:
+                    kind:
+                      description: Kind of the network resource
+                      enum:
+                      - VirtualService
+                      - Ingress
+                      type: string
+                    name:
+                      description: Name of the network resource
+                      type: string
+                  required:
+                  - kind
+                  - name
+                  type: object
+                type: array
+              operatorID:
+                description: |-
+                  Identifier for the operator instance that should process this FailoverGroup
+                  This allows running multiple operator instances for different applications
+                type: string
+              suspended:
+                default: false
+                description: |-
+                  When true, automatic failovers are disabled (manual override for maintenance)
+                  The operator will not create automatic failovers even if it detects problems
+                type: boolean
+              suspensionReason:
+                description: |-
+                  Documentation field explaining why automatic failovers are suspended
+                  Only meaningful when suspended=true
+                type: string
+              timeouts:
+                description: Timeout settings for automatic operations
+                properties:
+                  heartbeat:
+                    description: |-
+                      Time without heartbeats before assuming a cluster is down
+                      The operator creates a failover after this period if no heartbeats are received
+                    type: string
+                  transitoryState:
+                    description: |-
+                      Maximum time a FailoverGroup can remain in FAILOVER/FAILBACK states
+                      After this period, the operator initiates an automatic rollback
+                    type: string
+                  unhealthyPrimary:
+                    description: |-
+                      Time that a PRIMARY cluster can remain unhealthy before auto-failover
+                      The operator creates a failover after this period if health status=ERROR
+                    type: string
+                type: object
+              workloads:
+                description: Workloads that need scaling and health tracking during
+                  failover
+                items:
+                  description: WorkloadSpec defines a workload resource
+                  properties:
+                    kind:
+                      description: Kind of the workload resource
+                      enum:
+                      - Deployment
+                      - StatefulSet
+                      - CronJob
+                      type: string
+                    name:
+                      description: Name of the workload resource
+                      type: string
+                    volumeReplications:
+                      description: VolumeReplications are the volume replications
+                        associated with this workload
+                      items:
+                        type: string
+                      type: array
+                  required:
+                  - kind
+                  - name
+                  type: object
+                type: array
+            required:
+            - suspended
             type: object
           status:
             description: FailoverGroupStatus defines the observed state of FailoverGroup
+            properties:
+              conditions:
+                description: Conditions represent the current state of failover reconciliation.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              fluxResources:
+                description: FluxResources contains status information for each Flux
+                  resource defined in the spec
+                items:
+                  description: FluxResourceStatus defines the status of a Flux GitOps
+                    resource
+                  properties:
+                    health:
+                      description: |-
+                        Health indicates the health status of the Flux resource
+                        Values: "OK", "DEGRADED", "ERROR"
+                      enum:
+                      - OK
+                      - DEGRADED
+                      - ERROR
+                      type: string
+                    kind:
+                      description: Kind of the Flux resource
+                      type: string
+                    name:
+                      description: Name of the Flux resource
+                      type: string
+                    status:
+                      description: Status provides additional details about the Flux
+                        resource status
+                      type: string
+                  required:
+                  - health
+                  - kind
+                  - name
+                  type: object
+                type: array
+              globalState:
+                description: GlobalState contains global state information synced
+                  from DynamoDB
+                properties:
+                  activeCluster:
+                    description: Which cluster is currently PRIMARY for this group
+                    type: string
+                  clusters:
+                    description: Information about all clusters participating in this
+                      FailoverGroup
+                    items:
+                      description: ClusterInfo contains information about a cluster
+                        in the FailoverGroup
+                      properties:
+                        health:
+                          description: Health status of the cluster
+                          enum:
+                          - OK
+                          - DEGRADED
+                          - ERROR
+                          - UNKNOWN
+                          type: string
+                        lastHeartbeat:
+                          description: LastHeartbeat is the timestamp of the last
+                            heartbeat received
+                          type: string
+                        name:
+                          description: Name of the cluster
+                          type: string
+                        role:
+                          description: Role of the cluster (PRIMARY or STANDBY)
+                          enum:
+                          - PRIMARY
+                          - STANDBY
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  dbSyncStatus:
+                    description: Status of DynamoDB synchronization
+                    enum:
+                    - Synced
+                    - Syncing
+                    - Error
+                    type: string
+                  lastFailover:
+                    additionalProperties:
+                      type: string
+                    description: Reference to the most recent failover operation
+                    type: object
+                  lastSyncTime:
+                    description: LastSyncTime is when the last successful sync with
+                      DynamoDB occurred
+                    type: string
+                  thisCluster:
+                    description: This cluster's name (for convenience)
+                    type: string
+                type: object
+              health:
+                description: |-
+                  Health indicates the overall health of the failover group
+                  Values: "OK", "DEGRADED", "ERROR"
+                enum:
+                - OK
+                - DEGRADED
+                - ERROR
+                type: string
+              lastFailoverTime:
+                description: LastFailoverTime is the time when the last failover operation
+                  completed
+                type: string
+              networkResources:
+                description: NetworkResources contains status information for each
+                  network resource defined in the spec
+                items:
+                  description: NetworkResourceStatus defines the status of a network
+                    resource
+                  properties:
+                    health:
+                      description: |-
+                        Health indicates the health status of the network resource
+                        Values: "OK", "DEGRADED", "ERROR"
+                      enum:
+                      - OK
+                      - DEGRADED
+                      - ERROR
+                      type: string
+                    kind:
+                      description: Kind of the network resource
+                      type: string
+                    name:
+                      description: Name of the network resource
+                      type: string
+                    status:
+                      description: Status provides additional details about the network
+                        resource status
+                      type: string
+                  required:
+                  - health
+                  - kind
+                  - name
+                  type: object
+                type: array
+              suspended:
+                description: |-
+                  Suspended indicates if the failover group is currently suspended
+                  This directly reflects the spec.suspended field and is shown in status for easier visibility
+                type: boolean
+              workloads:
+                description: Workloads contains status information for each workload
+                  defined in the spec
+                items:
+                  description: WorkloadStatus defines the status of a workload
+                  properties:
+                    health:
+                      description: |-
+                        Health indicates the health status of the workload
+                        Values: "OK", "DEGRADED", "ERROR"
+                      enum:
+                      - OK
+                      - DEGRADED
+                      - ERROR
+                      type: string
+                    kind:
+                      description: Kind of the workload resource
+                      type: string
+                    name:
+                      description: Name of the workload resource
+                      type: string
+                    status:
+                      description: Status provides additional details about the workload
+                        status
+                      type: string
+                    volumeReplications:
+                      description: VolumeReplications contains the status of volume
+                        replications associated with this workload
+                      items:
+                        description: VolumeReplicationStatus defines the status of
+                          a volume replication
+                        properties:
+                          health:
+                            description: |-
+                              Health indicates the replication health status
+                              Values: "OK", "DEGRADED", "ERROR"
+                            enum:
+                            - OK
+                            - DEGRADED
+                            - ERROR
+                            type: string
+                          name:
+                            description: Name of the volume replication
+                            type: string
+                          status:
+                            description: Status provides additional details about
+                              the replication status
+                            type: string
+                        required:
+                        - health
+                        - name
+                        type: object
+                      type: array
+                  required:
+                  - health
+                  - kind
+                  - name
+                  type: object
+                type: array
+            required:
+            - suspended
             type: object
         type: object
     served: true

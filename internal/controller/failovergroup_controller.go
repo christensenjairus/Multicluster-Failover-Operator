@@ -25,12 +25,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfigs"
 )
 
 // FailoverGroupReconciler reconciles a FailoverGroup object
 type FailoverGroupReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme    *runtime.Scheme
+	MCManager kubeconfigs.Manager
 }
 
 // +kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovergroups,verbs=get;list;watch;create;update;patch;delete

@@ -4,6 +4,63 @@
 ## Description
 // TODO(user): An in-depth paragraph about your project and overview of use
 
+## Multicluster Functionality
+
+This operator provides a multicluster management system that allows dynamically adding and removing clusters without restarting the operator.
+
+### Adding Remote Clusters
+
+Remote clusters are added by creating Kubernetes secrets containing kubeconfig data in the operator's namespace:
+
+1. Use the provided script to create a kubeconfig secret:
+
+```sh
+./examples/create-kubeconfig-secret.sh -n cluster1 -c my-context -k ~/.kube/config
+```
+
+2. Alternatively, create a secret manually using the provided example YAML:
+
+```sh
+kubectl apply -f examples/kubeconfig-secret-example.yaml
+```
+
+The secret should have:
+- A name that will be used as the cluster identifier
+- The label `sigs.k8s.io/multicluster-runtime-kubeconfig: "true"`
+- The kubeconfig data stored under the key `kubeconfig`
+
+### Accessing Remote Clusters in Controllers
+
+Once a kubeconfig secret is created, the operator will automatically:
+1. Detect the new secret
+2. Create a controller-runtime cluster client for it
+3. Log the list of managed clusters
+4. Make the cluster available through the MulticlusterManager
+
+Example of accessing a remote cluster in your reconciler:
+
+```go
+// Get a remote cluster client
+remoteCluster, err := r.MCManager.Get(ctx, "cluster1")
+if err != nil {
+    // Handle error - cluster might not be available
+    return ctrl.Result{}, err
+}
+
+// Use the remote cluster client
+pods := &corev1.PodList{}
+err = remoteCluster.GetClient().List(ctx, pods, client.InNamespace("default"))
+```
+
+### Monitoring Managed Clusters
+
+The operator provides real-time detection of kubeconfig secrets:
+- When a kubeconfig secret is created, the operator immediately detects it and engages the cluster
+- When a kubeconfig secret is updated, the operator immediately detects it and updates the cluster connection
+- When a kubeconfig secret is deleted, the operator immediately detects it and disengages the cluster
+
+The operator logs the list of all managed clusters after each change. Look for log entries with the message "Currently managing the following clusters".
+
 ## Getting Started
 
 ### Prerequisites
@@ -21,7 +78,7 @@ make docker-build docker-push IMG=<some-registry>/multicluster-failover-operator
 
 **NOTE:** This image ought to be published in the personal registry you specified.
 And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+Make sure you have the proper permission to the registry if the above commands don't work.
 
 **Install the CRDs into the cluster:**
 
@@ -111,4 +168,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
