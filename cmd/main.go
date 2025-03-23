@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -35,8 +36,11 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfigs"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -144,20 +148,66 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err = (&controller.FailoverGroupReconciler{
-		Client: mgr.GetClient(),
+	// Setup multicluster functionality
+	namespace, err := getOperatorNamespace()
+	if err != nil {
+		setupLog.Error(err, "unable to determine operator namespace")
+		os.Exit(1)
+	}
+
+	setupLog.Info("initializing multicluster support", "namespace", namespace)
+	
+	// Initialize kubeconfig provider with static label and auto-detected namespace
+	provider := kubeconfigs.New(mgr.GetClient(), kubeconfigs.Options{
+		Namespace:       namespace,
+		KubeconfigLabel: "multicluster-runtime-kubeconfig",
+	})
+
+	// Create multicluster manager
+	mcMgr, err := mcmanager.New(mgr.GetConfig(), provider, ctrl.Options{
 		Scheme: mgr.GetScheme(),
+	})
+	if err != nil {
+		setupLog.Error(err, "unable to create multicluster manager")
+		os.Exit(1)
+	}
+
+	// Start provider and multicluster manager
+	ctx := ctrl.SetupSignalHandler()
+	go func() {
+		setupLog.Info("starting kubeconfig provider")
+		if err := provider.Run(ctx, mcMgr); err != nil {
+			setupLog.Error(err, "problem running kubeconfig provider")
+			os.Exit(1)
+		}
+	}()
+
+	go func() {
+		setupLog.Info("starting multicluster manager")
+		if err := mcMgr.Start(ctx); err != nil {
+			setupLog.Error(err, "problem running multicluster manager")
+			os.Exit(1)
+		}
+	}()
+
+	if err = (&controller.FailoverGroupReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		MCManager: mcMgr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "FailoverGroup")
 		os.Exit(1)
 	}
+	
 	if err = (&controller.FailoverReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		MCManager: mcMgr,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Failover")
 		os.Exit(1)
 	}
+	
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -174,4 +224,22 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+// getOperatorNamespace returns the namespace the operator is currently running in.
+func getOperatorNamespace() (string, error) {
+	// Check if running in a pod
+	ns, found := os.LookupEnv("POD_NAMESPACE")
+	if found {
+		return ns, nil
+	}
+	
+	// If not running in a pod, try to get from the service account namespace
+	nsBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err == nil {
+		return string(nsBytes), nil
+	}
+	
+	// Default to the standard operator namespace
+	return "multicluster-failover-operator-system", nil
 }
