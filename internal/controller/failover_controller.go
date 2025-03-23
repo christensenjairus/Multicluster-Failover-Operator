@@ -227,12 +227,20 @@ func (r *FailoverReconciler) syncToOtherClusters(ctx context.Context, failover *
 	}
 }
 
-// ListClusters is a helper method that safely returns clusters or an empty map
+// ListClusters returns a list of all registered clusters
 func (r *FailoverReconciler) ListClusters() map[string]cluster.Cluster {
 	if r.MCReconciler == nil {
 		return map[string]cluster.Cluster{}
 	}
 	return r.MCReconciler.ListClusters()
+}
+
+// ListClustersWithLog returns a list of all registered clusters and logs them
+func (r *FailoverReconciler) ListClustersWithLog() map[string]cluster.Cluster {
+	if r.MCReconciler == nil {
+		return map[string]cluster.Cluster{}
+	}
+	return r.MCReconciler.ListClustersWithLog()
 }
 
 // SetupWithManager sets up the controller with the Manager.

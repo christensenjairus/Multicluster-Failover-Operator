@@ -48,7 +48,6 @@ import (
 	"github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfigs"
 
 	// Import multicluster-runtime packages
-	mcmanager "github.com/multicluster-runtime/multicluster-runtime/pkg/manager"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -212,7 +211,7 @@ func main() {
 	})
 
 	// Create a multicluster reconciler
-	mcReconciler := &multiclusterReconciler{
+	mcReconciler := &MulticlusterReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		clusters: make(map[string]cluster.Cluster),
@@ -241,7 +240,7 @@ func main() {
 	go func() {
 		setupLog.Info("starting kubeconfig provider")
 		// Create a proper adapter that implements the Manager interface
-		managerAdapter := &KubeconfigManagerAdapter{
+		managerAdapter := &KubeconfigClusterManager{
 			Client:     mgr.GetClient(),
 			clusters:   make(map[string]cluster.Cluster),
 			reconciler: mcReconciler,
@@ -288,48 +287,28 @@ func getOperatorNamespace() (string, error) {
 	return "multicluster-failover-operator-system", nil
 }
 
-// MCManagerAdapter adapts a multicluster-runtime Manager to a kubeconfigs.Manager
-type MCManagerAdapter struct {
-	mcmanager.Manager
-}
-
-// Get implements the kubeconfigs.Manager Get method
-func (a *MCManagerAdapter) Get(ctx context.Context, name string) (cluster.Cluster, error) {
-	return a.GetCluster(ctx, name)
-}
-
-// Engage implements the kubeconfigs.Manager Engage method
-func (a *MCManagerAdapter) Engage(ctx context.Context, name string, cl cluster.Cluster) error {
-	// The multicluster-runtime manager doesn't have an Engage method
-	// This is called by the provider to register new clusters
-	// We'll log it and return nil since this is handled internally by the provider
-	setupLog.Info("Engage called on MCManagerAdapter", "cluster", name)
-	return nil
-}
-
-// KubeconfigManagerAdapter implements the kubeconfigs.Manager interface
-type KubeconfigManagerAdapter struct {
+// KubeconfigClusterManager implements kubeconfigs.ClusterManager for cluster management
+type KubeconfigClusterManager struct {
 	Client     client.Client
 	lock       sync.RWMutex
 	clusters   map[string]cluster.Cluster
-	reconciler *multiclusterReconciler
+	reconciler *MulticlusterReconciler
 }
 
-// Get implements the kubeconfigs.Manager Get method
-func (a *KubeconfigManagerAdapter) Get(ctx context.Context, name string) (cluster.Cluster, error) {
+// GetCluster returns the cluster with the given name.
+func (a *KubeconfigClusterManager) GetCluster(ctx context.Context, name string) (cluster.Cluster, error) {
 	a.lock.RLock()
 	defer a.lock.RUnlock()
 
 	if cl, exists := a.clusters[name]; exists {
-		setupLog.Info("Found existing cluster in adapter", "name", name)
+		setupLog.Info("Found existing cluster", "name", name)
 		return cl, nil
 	}
-	setupLog.Error(fmt.Errorf("cluster not found"), "Failed to get cluster", "name", name, "availableClusters", len(a.clusters))
 	return nil, fmt.Errorf("cluster %s not found", name)
 }
 
-// Engage implements the kubeconfigs.Manager Engage method
-func (a *KubeconfigManagerAdapter) Engage(ctx context.Context, name string, cl cluster.Cluster) error {
+// Engage registers a new cluster with the adapter
+func (a *KubeconfigClusterManager) Engage(ctx context.Context, name string, cl cluster.Cluster) error {
 	a.lock.Lock()
 	defer a.lock.Unlock()
 
@@ -344,7 +323,7 @@ func (a *KubeconfigManagerAdapter) Engage(ctx context.Context, name string, cl c
 	// Initialize the multicluster reconciler if needed
 	if a.reconciler != nil {
 		// Tell the reconciler about the new cluster
-		a.reconciler.registerCluster(name, cl)
+		a.reconciler.RegisterCluster(name, cl)
 	} else {
 		setupLog.Error(nil, "Reconciler not initialized, can't register cluster", "name", name)
 	}
@@ -359,16 +338,16 @@ func (a *KubeconfigManagerAdapter) Engage(ctx context.Context, name string, cl c
 	return nil
 }
 
-// multiclusterReconciler handles reconciliations across multiple clusters
-type multiclusterReconciler struct {
+// MulticlusterReconciler handles reconciliations across multiple clusters
+type MulticlusterReconciler struct {
 	Client   client.Client
 	Scheme   *runtime.Scheme
 	lock     sync.RWMutex
 	clusters map[string]cluster.Cluster
 }
 
-// registerCluster registers a new cluster with the reconciler
-func (r *multiclusterReconciler) registerCluster(name string, cl cluster.Cluster) {
+// RegisterCluster registers a new cluster with the reconciler
+func (r *MulticlusterReconciler) RegisterCluster(name string, cl cluster.Cluster) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
@@ -406,7 +385,7 @@ func (r *multiclusterReconciler) registerCluster(name string, cl cluster.Cluster
 }
 
 // ListClusters returns a list of all registered clusters
-func (r *multiclusterReconciler) ListClusters() map[string]cluster.Cluster {
+func (r *MulticlusterReconciler) ListClusters() map[string]cluster.Cluster {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 
@@ -419,7 +398,7 @@ func (r *multiclusterReconciler) ListClusters() map[string]cluster.Cluster {
 }
 
 // ListClustersWithLog returns a list of all registered clusters and logs them
-func (r *multiclusterReconciler) ListClustersWithLog() map[string]cluster.Cluster {
+func (r *MulticlusterReconciler) ListClustersWithLog() map[string]cluster.Cluster {
 	r.lock.RLock()
 	defer r.lock.RUnlock()
 
