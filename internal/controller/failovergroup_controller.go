@@ -126,7 +126,11 @@ func (r *FailoverGroupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Determine the active/primary cluster
 	activeCluster := determineActiveCluster(failoverGroup)
-	logger.Info("Active cluster determined", "activeCluster", activeCluster)
+	if activeCluster != "" {
+		logger.Info("Active cluster determined", "activeCluster", activeCluster)
+	} else {
+		logger.Info("No active cluster could be determined from FailoverGroup status")
+	}
 
 	// If we are not the active cluster and not in sync mode, check if we need to fetch the latest version from the active cluster
 	if clusterName != activeCluster && !syncMode && activeCluster != "" {

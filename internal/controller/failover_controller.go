@@ -105,8 +105,14 @@ func (r *FailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	logger.Info("Successfully retrieved Failover",
 		"name", failover.Name,
-		"namespace", failover.Namespace,
-		"targetCluster", failover.Spec.TargetCluster)
+		"namespace", failover.Namespace)
+
+	// Add conditional logging for the target cluster
+	if failover.Spec.TargetCluster != "" {
+		logger.Info("Failover target cluster specified", "targetCluster", failover.Spec.TargetCluster)
+	} else {
+		logger.Info("No target cluster specified in Failover resource")
+	}
 
 	// If we are not the target cluster and not in sync mode, check if we need to fetch the latest version from the target cluster
 	if clusterName != failover.Spec.TargetCluster && !syncMode && failover.Spec.TargetCluster != "" {

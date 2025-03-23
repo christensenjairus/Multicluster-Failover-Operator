@@ -36,7 +36,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/scheme"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
@@ -197,7 +196,7 @@ func (p *KubeconfigProvider) Run(ctx context.Context, mgr Manager) error {
 				case watch.Added, watch.Modified:
 					p.handleSecretUpsert(ctx, secret)
 				case watch.Deleted:
-					p.handleSecretDelete(ctx, secret)
+					p.handleSecretDelete(secret)
 				}
 
 				// Log managed clusters after each change
@@ -224,51 +223,6 @@ func (p *KubeconfigProvider) Run(ctx context.Context, mgr Manager) error {
 			}
 		}
 	}
-}
-
-// hasKubeconfigLabel checks if a secret has our kubeconfig label
-func (p *KubeconfigProvider) hasKubeconfigLabel(secret *corev1.Secret) bool {
-	value, exists := secret.Labels[p.opts.KubeconfigLabel]
-	return exists && value == "true"
-}
-
-// secretReconciler implements controller.Reconciler to reconcile Secret objects
-type secretReconciler struct {
-	provider *KubeconfigProvider
-	log      logr.Logger
-}
-
-// Reconcile handles Secret events
-func (r *secretReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
-	log := r.log.WithValues("secret", req.NamespacedName)
-
-	// Get the secret
-	secret := &corev1.Secret{}
-	err := r.provider.client.Get(ctx, req.NamespacedName, secret)
-	if err != nil {
-		if client.IgnoreNotFound(err) != nil {
-			log.Error(err, "Failed to get Secret")
-			return reconcile.Result{}, err
-		}
-		// Secret was deleted
-		log.Info("Secret deleted, disengaging cluster")
-		r.provider.handleSecretDelete(ctx, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      req.Name,
-				Namespace: req.Namespace,
-			},
-		})
-		return reconcile.Result{}, nil
-	}
-
-	// Handle create/update
-	log.Info("Secret created or updated")
-	r.provider.handleSecretUpsert(ctx, secret)
-
-	// Log managed clusters after changes
-	r.provider.logManagedClusters()
-
-	return reconcile.Result{}, nil
 }
 
 // logManagedClusters logs the list of all currently managed clusters
@@ -318,7 +272,7 @@ func (p *KubeconfigProvider) syncSecrets(ctx context.Context) error {
 		if _, exists := currentKeys[key]; !exists {
 			// This secret has been deleted
 			p.lock.RUnlock()
-			p.handleSecretDelete(ctx, &corev1.Secret{
+			p.handleSecretDelete(&corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      name,
 					Namespace: p.opts.Namespace,
@@ -441,7 +395,7 @@ func (p *KubeconfigProvider) handleSecretUpsert(ctx context.Context, secret *cor
 }
 
 // handleSecretDelete handles the deletion of a kubeconfig secret
-func (p *KubeconfigProvider) handleSecretDelete(ctx context.Context, secret *corev1.Secret) {
+func (p *KubeconfigProvider) handleSecretDelete(secret *corev1.Secret) {
 	log := p.log.WithValues("secret", types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace})
 	log.Info("Handling kubeconfig secret deletion")
 
