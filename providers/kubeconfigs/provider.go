@@ -37,6 +37,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/scheme"
+
+	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 const (
@@ -45,7 +49,7 @@ const (
 	// DefaultKubeconfigSecretKey is the default key in the secret data that contains the kubeconfig
 	DefaultKubeconfigSecretKey = "kubeconfig"
 	// PollInterval is how often to poll for secrets
-	PollInterval = 30 * time.Second
+	PollInterval = 5 * time.Second
 )
 
 // Manager represents a multicluster manager interface
@@ -383,12 +387,30 @@ func (p *KubeconfigProvider) handleSecretUpsert(ctx context.Context, secret *cor
 		return
 	}
 
+	log.Info("Found kubeconfig data in secret", "dataSize", len(kubeconfigData))
+
 	// Parse kubeconfig and create REST config
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
 	if err != nil {
 		log.Error(err, "failed to parse kubeconfig")
 		return
 	}
+
+	// Test connection to API server
+	log.Info("Testing connection to API server", "host", restConfig.Host)
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		log.Error(err, "failed to create clientset from config")
+		return
+	}
+
+	// Attempt to list nodes as a basic connectivity test
+	_, err = clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
+	if err != nil {
+		log.Error(err, "failed to connect to Kubernetes API server", "host", restConfig.Host)
+		return
+	}
+	log.Info("Successfully connected to API server", "host", restConfig.Host)
 
 	// If cluster exists and it's an update, we need to stop the old one and create a new one
 	if exists {
@@ -445,7 +467,41 @@ func (p *KubeconfigProvider) handleSecretDelete(ctx context.Context, secret *cor
 // createAndStartCluster creates a new controller-runtime cluster and starts it
 func (p *KubeconfigProvider) createAndStartCluster(ctx context.Context, clusterName string, config *rest.Config, log logr.Logger) (cluster.Cluster, error) {
 	// Create cluster
-	cl, err := cluster.New(config, p.opts.ClusterOptions...)
+	log.Info("Creating new controller-runtime cluster", "name", clusterName)
+
+	// Add timeout to the config
+	config.Timeout = 10 * time.Second
+
+	// Create a scheme with our custom types
+	s := runtime.NewScheme()
+	schemeBuilder := &scheme.Builder{GroupVersion: crdv1alpha1.GroupVersion}
+	schemeBuilder.Register(&crdv1alpha1.FailoverGroup{}, &crdv1alpha1.FailoverGroupList{})
+	schemeBuilder.Register(&crdv1alpha1.Failover{}, &crdv1alpha1.FailoverList{})
+	_ = schemeBuilder.AddToScheme(s)
+	_ = corev1.AddToScheme(s) // Add core types
+
+	// Create options with our scheme
+	options := cluster.Options{
+		Scheme: s,
+	}
+
+	// Combine with any other options
+	if len(p.opts.ClusterOptions) > 0 {
+		// Use the first option to modify our options
+		for _, opt := range p.opts.ClusterOptions {
+			opt(&options)
+		}
+	}
+
+	// Convert Options back to Option functions
+	opts := []cluster.Option{
+		func(o *cluster.Options) {
+			*o = options
+		},
+	}
+
+	// Create the cluster with our scheme
+	cl, err := cluster.New(config, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cluster: %w", err)
 	}
@@ -466,6 +522,7 @@ func (p *KubeconfigProvider) createAndStartCluster(ctx context.Context, clusterN
 	clusterCtx, cancel := context.WithCancel(ctx)
 
 	// Start the cluster
+	log.Info("Starting cluster client", "name", clusterName)
 	go func() {
 		if err := cl.Start(clusterCtx); err != nil {
 			log.Error(err, "failed to start cluster")
@@ -473,11 +530,25 @@ func (p *KubeconfigProvider) createAndStartCluster(ctx context.Context, clusterN
 		}
 	}()
 
-	// Wait for cache sync
-	if !cl.GetCache().WaitForCacheSync(clusterCtx) {
+	// Wait for cache sync with a timeout
+	syncCtx, cancelSync := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelSync()
+
+	log.Info("Waiting for cache sync", "name", clusterName)
+	if !cl.GetCache().WaitForCacheSync(syncCtx) {
 		cancel()
-		return nil, fmt.Errorf("failed to sync cache")
+		return nil, fmt.Errorf("failed to sync cache within timeout")
 	}
+	log.Info("Cache sync completed successfully", "name", clusterName)
+
+	// Test that the client works
+	testPods := &corev1.PodList{}
+	if err := cl.GetClient().List(ctx, testPods, client.InNamespace("default"), client.Limit(1)); err != nil {
+		log.Error(err, "cluster client test failed - couldn't list pods", "name", clusterName)
+		cancel()
+		return nil, fmt.Errorf("cluster client test failed: %w", err)
+	}
+	log.Info("Cluster client test successful", "name", clusterName, "podsFound", len(testPods.Items))
 
 	// Add to our maps
 	p.lock.Lock()
@@ -499,6 +570,8 @@ func (p *KubeconfigProvider) engageCluster(ctx context.Context, clusterName stri
 		return fmt.Errorf("provider not initialized with manager")
 	}
 
+	p.log.Info("Engaging cluster with manager", "name", clusterName)
+
 	// Engage the manager with this cluster
 	if err := mgr.Engage(ctx, clusterName, cl); err != nil {
 		// Clean up on error
@@ -513,5 +586,6 @@ func (p *KubeconfigProvider) engageCluster(ctx context.Context, clusterName stri
 		return fmt.Errorf("failed to engage manager: %w", err)
 	}
 
+	p.log.Info("Successfully engaged cluster with manager", "name", clusterName)
 	return nil
 }

@@ -20,21 +20,27 @@ import (
 	"context"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
-	"github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfigs"
-	corev1 "k8s.io/api/core/v1"
+	// We're no longer using the multicluster-runtime directly in the controllers
+	// The main.go will handle setting up the controllers with mcbuilder
+
+	"github.com/go-logr/logr"
 )
 
 // FailoverReconciler reconciles a Failover object
 type FailoverReconciler struct {
 	client.Client
-	Scheme    *runtime.Scheme
-	MCManager kubeconfigs.Manager
+	Scheme *runtime.Scheme
+	// Optional reference to the multicluster reconciler
+	MCReconciler MulticlusterReconcilerInterface
 }
 
 // +kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers,verbs=get;list;watch;create;update;patch;delete
@@ -43,60 +49,427 @@ type FailoverReconciler struct {
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the Failover object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.0/pkg/reconcile
 func (r *FailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Fetch the Failover instance
+	// Check if we're dealing with a specific remote cluster
+	var clusterName string
+	var targetClient client.Client
+	var crdOnly bool
+	var syncMode bool
+
+	// Check if this is a CRD-only reconciliation
+	if ctx.Value("crdOnly") != nil && ctx.Value("crdOnly").(bool) {
+		crdOnly = true
+		logger = logger.WithValues("reconcileType", "crdOnly")
+	}
+
+	// Check if this is a sync operation
+	if ctx.Value("syncMode") != nil && ctx.Value("syncMode").(bool) {
+		syncMode = true
+		logger = logger.WithValues("reconcileType", "sync")
+	}
+
+	// Get cluster name from context if available
+	if ctx.Value("clusterName") != nil {
+		clusterName = ctx.Value("clusterName").(string)
+		logger = logger.WithValues("cluster", clusterName)
+
+		// Get the client for the specific cluster
+		clusters := r.ListClusters()
+		if cl, ok := clusters[clusterName]; ok && cl != nil {
+			targetClient = cl.GetClient()
+			logger.Info("Using remote cluster client", "cluster", clusterName)
+		} else {
+			logger.Error(nil, "Remote cluster not found or nil", "cluster", clusterName)
+			return ctrl.Result{}, nil
+		}
+	} else {
+		// Use the regular client for local cluster
+		targetClient = r.Client
+		logger.Info("Using local cluster client")
+	}
+
+	// Get the Failover resource
 	failover := &crdv1alpha1.Failover{}
-	if err := r.Get(ctx, req.NamespacedName, failover); err != nil {
+
+	// Get the Failover from the local/target cluster
+	if err := targetClient.Get(ctx, req.NamespacedName, failover); err != nil {
 		if client.IgnoreNotFound(err) != nil {
-			logger.Error(err, "unable to fetch Failover")
+			logger.Error(err, "Unable to fetch Failover")
 			return ctrl.Result{}, err
 		}
-		// Failover was deleted, nothing to do
+		logger.Info("Failover resource not found. Ignoring since object must have been deleted")
 		return ctrl.Result{}, nil
 	}
 
-	// Example: Access a remote cluster using the MCManager
-	// This is just a demonstration and should be customized based on your needs
-	clusterName := "cluster1" // This would typically come from the Failover spec
+	logger.Info("Successfully retrieved Failover",
+		"name", failover.Name,
+		"namespace", failover.Namespace,
+		"targetCluster", failover.Spec.TargetCluster)
 
-	// Get a remote cluster client
-	remoteCluster, err := r.MCManager.Get(ctx, clusterName)
-	if err != nil {
-		logger.Info("Remote cluster not available", "cluster", clusterName, "error", err.Error())
-		// Handle the case where the cluster isn't available yet
-		// You might want to set a status condition on the Failover object
-		return ctrl.Result{RequeueAfter: time.Second * 30}, nil
+	// If we are not the target cluster and not in sync mode, check if we need to fetch the latest version from the target cluster
+	if clusterName != failover.Spec.TargetCluster && !syncMode && failover.Spec.TargetCluster != "" {
+		// Get the client for the target cluster
+		clusters := r.ListClusters()
+		if cl, ok := clusters[failover.Spec.TargetCluster]; ok && cl != nil {
+			targetClusterClient := cl.GetClient()
+
+			// Get the Failover from the target cluster
+			targetFO := &crdv1alpha1.Failover{}
+			err := targetClusterClient.Get(ctx, req.NamespacedName, targetFO)
+			if err == nil {
+				// We found the resource in the target cluster, check if we need to update our local copy
+				if shouldUpdateFromTarget(failover, targetFO) {
+					logger.Info("Updating local Failover from target cluster",
+						"targetCluster", failover.Spec.TargetCluster,
+						"localResourceVersion", failover.ResourceVersion,
+						"targetResourceVersion", targetFO.ResourceVersion)
+
+					// Update our local copy with changes from the target cluster
+					syncCtx := context.WithValue(ctx, "syncMode", true)
+					syncCtx = context.WithValue(syncCtx, "failover", targetFO)
+
+					// Call Reconcile with sync context
+					return r.Reconcile(syncCtx, req)
+				}
+			} else if !errors.IsNotFound(err) {
+				logger.Error(err, "Error getting Failover from target cluster")
+			}
+		}
 	}
 
-	// Now you can use the remote cluster client to interact with resources
-	// For example, list pods in the default namespace
-	pods := &corev1.PodList{}
-	if err := remoteCluster.GetClient().List(ctx, pods, client.InNamespace("default")); err != nil {
-		logger.Error(err, "failed to list pods in remote cluster", "cluster", clusterName)
+	// If we're the target cluster, and there's a change, sync to other clusters
+	if (clusterName == failover.Spec.TargetCluster || (clusterName == "" && failover.Spec.TargetCluster == "")) && !syncMode {
+		// This cluster is the target one (or we're in the management cluster and no target cluster is specified)
+		// Now, let's synchronize this to all other clusters
+		go r.syncToOtherClusters(ctx, failover)
+	}
+
+	// CRD-only reconciliation ends here if requested
+	if crdOnly {
+		logger.Info("Performing CRD-only reconciliation, skipping managed resources")
+		return ctrl.Result{}, nil
+	}
+
+	// Continue with reconciliation
+	if clusterName == "" {
+		// This is the management cluster
+		err := r.reconcileFailover(ctx, logger, failover)
+		return ctrl.Result{}, err
+	} else {
+		// This is a remote cluster
+		err := r.reconcileFailoverInCluster(ctx, logger, failover, clusterName, targetClient)
 		return ctrl.Result{}, err
 	}
+}
 
-	logger.Info("Successfully connected to remote cluster",
-		"cluster", clusterName,
-		"podCount", len(pods.Items))
+// shouldUpdateFromTarget determines if the local Failover should be updated from the target cluster's version
+func shouldUpdateFromTarget(local, target *crdv1alpha1.Failover) bool {
+	// Compare resource versions if they're in the format we expect (numerical)
+	// Otherwise, we'll go with creation/modification timestamps
+	// In a real implementation, you might want a more sophisticated comparison
 
-	// Implement your failover logic here using the remote cluster
+	// Here we're assuming the target cluster version should always be used
+	// You could implement more complex logic here
+	return true
+}
 
-	return ctrl.Result{}, nil
+// syncToOtherClusters synchronizes a Failover from the target cluster to all other clusters
+func (r *FailoverReconciler) syncToOtherClusters(ctx context.Context, failover *crdv1alpha1.Failover) {
+	logger := log.FromContext(ctx).WithValues(
+		"syncOperation", "Failover",
+		"name", failover.Name,
+		"namespace", failover.Namespace,
+		"targetCluster", failover.Spec.TargetCluster)
+
+	// Get all registered remote clusters
+	clusters := r.ListClusters()
+	if len(clusters) == 0 {
+		logger.Info("No remote clusters available for synchronization")
+		return
+	}
+
+	logger.Info("Syncing Failover from target cluster to all other clusters", "clusterCount", len(clusters))
+
+	// Create a context with the Failover for the sync operation
+	syncCtx := context.WithValue(ctx, "syncMode", true)
+	syncCtx = context.WithValue(syncCtx, "failover", failover)
+
+	// Synchronize to each non-target remote cluster
+	for clusterName, _ := range clusters {
+		// Skip the target cluster, no need to sync to itself
+		if clusterName == failover.Spec.TargetCluster {
+			continue
+		}
+
+		clusterLogger := logger.WithValues("targetCluster", clusterName)
+		clusterLogger.Info("Synchronizing Failover to non-target cluster")
+
+		// Call Reconcile with the sync context for each remote cluster
+		clusterCtx := context.WithValue(syncCtx, "clusterName", clusterName)
+		_, err := r.Reconcile(clusterCtx, ctrl.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      failover.Name,
+				Namespace: failover.Namespace,
+			},
+		})
+
+		if err != nil {
+			clusterLogger.Error(err, "Failed to synchronize Failover to non-target cluster")
+		}
+	}
+}
+
+// ListClusters is a helper method that safely returns clusters or an empty map
+func (r *FailoverReconciler) ListClusters() map[string]cluster.Cluster {
+	if r.MCReconciler == nil {
+		return map[string]cluster.Cluster{}
+	}
+	return r.MCReconciler.ListClusters()
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *FailoverReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
+	// Standard controller watching the local cluster
+	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&crdv1alpha1.Failover{}).
-		Complete(r)
+		Complete(r); err != nil {
+		return err
+	}
+
+	// If we have a multicluster reconciler, set up a background watcher
+	if r.MCReconciler != nil {
+		go r.watchRemoteClusters(context.Background())
+	}
+
+	return nil
+}
+
+// watchRemoteClusters sets up watches on remote clusters for Failover resources
+func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
+	// Give the manager time to start and the clusters to connect
+	time.Sleep(5 * time.Second)
+
+	logger := log.FromContext(ctx)
+	logger.Info("Starting remote cluster watcher for Failover resources")
+
+	// Track which clusters we've set up watches for
+	watchedClusters := make(map[string]bool)
+
+	// Set up a ticker to check for new clusters
+	newClustersTicker := time.NewTicker(10 * time.Second)
+	defer newClustersTicker.Stop()
+
+	// Ticker for frequent reconciliation of CRDs
+	crdReconcileTicker := time.NewTicker(5 * time.Second)
+	defer crdReconcileTicker.Stop()
+
+	// Ticker for less frequent reconciliation of managed resources
+	resourceReconcileTicker := time.NewTicker(30 * time.Second)
+	defer resourceReconcileTicker.Stop()
+
+	// Keep track of the last time we did a full reconciliation for each cluster
+	lastFullReconcileTime := make(map[string]time.Time)
+
+	setupWatchForCluster := func(clusterName string, cl cluster.Cluster) {
+		if cl == nil || cl.GetClient() == nil {
+			logger.Error(nil, "Cluster client is nil", "cluster", clusterName)
+			return
+		}
+
+		// Set up a watch for Failover resources in this cluster
+		clusterLogger := logger.WithValues("cluster", clusterName)
+		clusterLogger.Info("Setting up watch for Failover resources")
+
+		// List current Failovers to trigger initial reconciliation
+		failovers := &crdv1alpha1.FailoverList{}
+		if err := cl.GetClient().List(ctx, failovers); err != nil {
+			clusterLogger.Error(err, "Failed to list Failover resources during watch setup")
+			return
+		}
+
+		// Process each existing Failover
+		if len(failovers.Items) > 0 {
+			clusterLogger.Info("Found existing Failover resources", "count", len(failovers.Items))
+			for _, f := range failovers.Items {
+				// Just reconcile the CRD initially, not its managed resources
+				go r.reconcileCRDOnly(ctx, clusterName, f)
+			}
+		} else {
+			clusterLogger.Info("No Failover resources found")
+		}
+
+		// Mark this cluster as watched and record the time for full reconciliation
+		watchedClusters[clusterName] = true
+		lastFullReconcileTime[clusterName] = time.Now()
+	}
+
+	checkClusters := func() {
+		// Get all registered clusters
+		clusters := r.ListClusters()
+		if len(clusters) == 0 {
+			return // No logging needed every time
+		}
+
+		// Check for new clusters
+		currentClusters := make(map[string]bool)
+		changesDetected := false
+
+		for clusterName, cl := range clusters {
+			currentClusters[clusterName] = true
+			if !watchedClusters[clusterName] {
+				setupWatchForCluster(clusterName, cl)
+				logger.Info("Added new cluster to watch list", "cluster", clusterName, "totalWatched", len(watchedClusters))
+				changesDetected = true
+			}
+		}
+
+		// Check for removed clusters
+		for clusterName := range watchedClusters {
+			if !currentClusters[clusterName] {
+				delete(watchedClusters, clusterName)
+				delete(lastFullReconcileTime, clusterName)
+				logger.Info("Removed cluster from watch list", "cluster", clusterName, "totalWatched", len(watchedClusters))
+				changesDetected = true
+			}
+		}
+
+		// If clusters were added or removed, log the full list
+		if changesDetected && r.MCReconciler != nil {
+			r.MCReconciler.ListClustersWithLog()
+		}
+	}
+
+	// Reconcile all Failover CRDs in a cluster
+	reconcileCRDs := func(clusterName string, cl cluster.Cluster) {
+		clusterLogger := logger.WithValues("cluster", clusterName)
+
+		// List Failover resources on this cluster
+		failovers := &crdv1alpha1.FailoverList{}
+		if err := cl.GetClient().List(ctx, failovers); err != nil {
+			clusterLogger.Error(err, "Failed to list Failover resources")
+			return
+		}
+
+		if len(failovers.Items) > 0 {
+			for _, f := range failovers.Items {
+				// Only reconcile the CRD itself, not managed resources
+				r.reconcileCRDOnly(ctx, clusterName, f)
+			}
+		}
+	}
+
+	// Do a full reconciliation including managed resources
+	performFullReconciliation := func(clusterName string, cl cluster.Cluster) {
+		clusterLogger := logger.WithValues("cluster", clusterName)
+
+		// List Failover resources on this cluster
+		failovers := &crdv1alpha1.FailoverList{}
+		if err := cl.GetClient().List(ctx, failovers); err != nil {
+			clusterLogger.Error(err, "Failed to list Failover resources for full reconciliation")
+			return
+		}
+
+		if len(failovers.Items) > 0 {
+			clusterLogger.Info("Performing full reconciliation of Failover resources", "count", len(failovers.Items))
+			for _, f := range failovers.Items {
+				// Full reconciliation including managed resources
+				r.Reconcile(context.WithValue(ctx, "clusterName", clusterName),
+					ctrl.Request{NamespacedName: types.NamespacedName{
+						Name:      f.Name,
+						Namespace: f.Namespace,
+					}})
+			}
+		}
+
+		// Update the last full reconcile time
+		lastFullReconcileTime[clusterName] = time.Now()
+	}
+
+	// Initial check for clusters
+	checkClusters()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-newClustersTicker.C:
+			// Check for new/removed clusters
+			checkClusters()
+
+		case <-crdReconcileTicker.C:
+			// Frequently reconcile just the CRDs
+			for clusterName, cl := range r.ListClusters() {
+				if watchedClusters[clusterName] && cl != nil && cl.GetClient() != nil {
+					reconcileCRDs(clusterName, cl)
+				}
+			}
+
+		case <-resourceReconcileTicker.C:
+			// Less frequently reconcile the managed resources
+			for clusterName, cl := range r.ListClusters() {
+				if watchedClusters[clusterName] && cl != nil && cl.GetClient() != nil {
+					performFullReconciliation(clusterName, cl)
+				}
+			}
+		}
+	}
+}
+
+// reconcileCRDOnly reconciles just the Failover CRD status, not its managed resources
+func (r *FailoverReconciler) reconcileCRDOnly(ctx context.Context, clusterName string, f crdv1alpha1.Failover) {
+	ctx = context.WithValue(ctx, "crdOnly", true)
+	ctx = context.WithValue(ctx, "clusterName", clusterName)
+
+	r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      f.Name,
+		Namespace: f.Namespace,
+	}})
+}
+
+// reconcileFailover handles the primary reconciliation logic for the Failover controller
+func (r *FailoverReconciler) reconcileFailover(ctx context.Context, logger logr.Logger, failover *crdv1alpha1.Failover) error {
+	// Get all registered clusters
+	clusters := r.ListClusters()
+	if len(clusters) == 0 {
+		logger.Info("No remote clusters available for failover")
+		return nil
+	}
+
+	logger.Info("Managing failover across clusters",
+		"clusterCount", len(clusters),
+		"targetCluster", failover.Spec.TargetCluster)
+
+	// Process workloads and resources based on the Failover spec
+	// This is a placeholder for actual failover logic
+	for clusterName, _ := range clusters {
+		clusterLogger := logger.WithValues("targetCluster", clusterName)
+		isTarget := clusterName == failover.Spec.TargetCluster
+
+		clusterLogger.Info("Processing cluster for failover",
+			"isTarget", isTarget)
+
+		// Here you would implement the actual failover logic based on the target cluster
+		// For example, scaling up resources in the target cluster and scaling down in others
+	}
+
+	return nil
+}
+
+// reconcileFailoverInCluster handles failover reconciliation within a specific cluster
+func (r *FailoverReconciler) reconcileFailoverInCluster(ctx context.Context, logger logr.Logger, failover *crdv1alpha1.Failover, clusterName string, targetClient client.Client) error {
+	isTarget := clusterName == failover.Spec.TargetCluster
+
+	logger.Info("Processing failover in specific cluster",
+		"cluster", clusterName,
+		"isTarget", isTarget)
+
+	// Here you would implement cluster-specific failover logic
+	// For example:
+	// - If this is the target cluster, ensure all resources are scaled up
+	// - If this is not the target cluster, ensure resources are scaled down or in standby
+
+	return nil
 }

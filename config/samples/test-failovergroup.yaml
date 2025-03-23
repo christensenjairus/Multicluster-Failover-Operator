@@ -1,0 +1,13 @@
+apiVersion: crd.hahomelabs.com/v1alpha1
+kind: FailoverGroup
+metadata:
+  name: test-failovergroup
+  namespace: test-failover
+spec:
+  suspended: false
+  workload:
+    kind: Deployment
+    name: test-app
+  network:
+    kind: Ingress
+    name: test-ingress 
