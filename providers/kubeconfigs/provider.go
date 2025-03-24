@@ -52,15 +52,6 @@ const (
 
 	// DefaultKubeconfigSecretKey is the default key in the secret data that contains the kubeconfig
 	DefaultKubeconfigSecretKey = "kubeconfig"
-
-	// PollInterval is how often to poll for secrets
-	PollInterval = 5 * time.Second
-
-	// ConnectionTimeout is the timeout for connecting to a cluster
-	ConnectionTimeout = 10 * time.Second
-
-	// CacheSyncTimeout is the timeout for waiting for the cache to sync
-	CacheSyncTimeout = 30 * time.Second
 )
 
 // ClusterManager defines the minimal interface needed for the KubeconfigProvider
@@ -98,8 +89,11 @@ type Options struct {
 	// Scheme is the scheme to use for the cluster. If not provided, a new one will be created.
 	Scheme *runtime.Scheme
 
-	// ClusterOptions are the options passed to the cluster constructor
-	ClusterOptions []cluster.Option
+	// ConnectionTimeout is the timeout for connecting to a cluster
+	ConnectionTimeout time.Duration
+
+	// CacheSyncTimeout is the timeout for waiting for the cache to sync
+	CacheSyncTimeout time.Duration
 }
 
 // KubeconfigProvider is a cluster provider that watches for secrets containing kubeconfig data
@@ -128,6 +122,12 @@ func New(cl client.Client, opts Options) *KubeconfigProvider {
 	}
 	if opts.KubeconfigKey == "" {
 		opts.KubeconfigKey = DefaultKubeconfigSecretKey
+	}
+	if opts.ConnectionTimeout == 0 {
+		opts.ConnectionTimeout = 10 * time.Second
+	}
+	if opts.CacheSyncTimeout == 0 {
+		opts.CacheSyncTimeout = 30 * time.Second
 	}
 
 	return &KubeconfigProvider{
@@ -262,7 +262,7 @@ func (p *KubeconfigProvider) Engage(ctx context.Context, clusterName string, con
 	log.Info("Creating new controller-runtime cluster")
 
 	// Add timeout to the config
-	config.Timeout = ConnectionTimeout
+	config.Timeout = p.opts.ConnectionTimeout
 
 	// Use provided scheme or create a new one
 	s := p.opts.Scheme
@@ -276,22 +276,10 @@ func (p *KubeconfigProvider) Engage(ctx context.Context, clusterName string, con
 		Scheme: s,
 	}
 
-	// Combine with any other options
-	if len(p.opts.ClusterOptions) > 0 {
-		for _, opt := range p.opts.ClusterOptions {
-			opt(&options)
-		}
-	}
-
-	// Convert Options back to Option functions
-	opts := []cluster.Option{
-		func(o *cluster.Options) {
-			*o = options
-		},
-	}
-
 	// Create the cluster with our scheme
-	cl, err := cluster.New(config, opts...)
+	cl, err := cluster.New(config, func(o *cluster.Options) {
+		*o = options
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create cluster: %w", err)
 	}
@@ -321,7 +309,7 @@ func (p *KubeconfigProvider) Engage(ctx context.Context, clusterName string, con
 	}()
 
 	// Wait for cache sync with a timeout
-	syncCtx, cancelSync := context.WithTimeout(ctx, CacheSyncTimeout)
+	syncCtx, cancelSync := context.WithTimeout(ctx, p.opts.CacheSyncTimeout)
 	defer cancelSync()
 
 	log.Info("Waiting for cache sync")

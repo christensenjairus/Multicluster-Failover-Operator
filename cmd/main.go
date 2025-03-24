@@ -206,9 +206,11 @@ func main() {
 	// Now let's set up the multicluster part
 	// Create the kubeconfig provider for multicluster discovery
 	provider := kubeconfigs.New(mgr.GetClient(), kubeconfigs.Options{
-		Namespace:       namespace,
-		KubeconfigLabel: "sigs.k8s.io/multicluster-runtime-kubeconfig",
-		Scheme:          scheme,
+		Namespace:         namespace, // Explicitly set the namespace from getOperatorNamespace()
+		KubeconfigLabel:   "sigs.k8s.io/multicluster-runtime-kubeconfig",
+		Scheme:            scheme,
+		ConnectionTimeout: 10 * time.Second,
+		CacheSyncTimeout:  30 * time.Second,
 	})
 
 	// Create a multicluster reconciler
