@@ -28,6 +28,7 @@ import (
 	"github.com/go-logr/logr"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,13 +37,13 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
+	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/scheme"
 
-	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/multicluster-runtime/multicluster-runtime/pkg/multicluster"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -64,11 +65,16 @@ const (
 
 // ClusterManager defines the minimal interface needed for the KubeconfigProvider
 type ClusterManager interface {
+	controllerruntime.Manager
+
 	// GetCluster returns a cluster for the given name
 	GetCluster(ctx context.Context, name string) (cluster.Cluster, error)
 
 	// Engage registers a new cluster with the manager
 	Engage(ctx context.Context, name string, cl cluster.Cluster) error
+
+	// Disengage removes a cluster from the manager
+	Disengage(ctx context.Context, name string) error
 }
 
 // index defines a field indexer
@@ -89,6 +95,9 @@ type Options struct {
 	// Key in the secret data that contains the kubeconfig
 	KubeconfigKey string
 
+	// Scheme is the scheme to use for the cluster. If not provided, a new one will be created.
+	Scheme *runtime.Scheme
+
 	// ClusterOptions are the options passed to the cluster constructor
 	ClusterOptions []cluster.Option
 }
@@ -99,6 +108,7 @@ type KubeconfigProvider struct {
 	opts       Options
 	log        logr.Logger
 	client     client.Client
+	Client     client.Client // For controller-runtime Reconciler interface
 	lock       sync.RWMutex
 	manager    ClusterManager
 	clusters   map[string]cluster.Cluster
@@ -124,6 +134,7 @@ func New(cl client.Client, opts Options) *KubeconfigProvider {
 		opts:       opts,
 		log:        log.Log.WithName("kubeconfig-provider"),
 		client:     cl,
+		Client:     cl, // Set both client fields
 		clusters:   map[string]cluster.Cluster{},
 		cancelFns:  map[string]context.CancelFunc{},
 		seenHashes: map[string]string{},
@@ -156,9 +167,6 @@ func (p *KubeconfigProvider) Run(ctx context.Context, mgr ClusterManager) error 
 	if err := p.syncSecrets(ctx); err != nil {
 		p.log.Error(err, "initial secret sync failed")
 	}
-
-	// Log the managed clusters after initial sync
-	p.logManagedClusters()
 
 	// Create a Kubernetes clientset for watching
 	var config *rest.Config
@@ -194,20 +202,35 @@ func (p *KubeconfigProvider) Run(ctx context.Context, mgr ClusterManager) error 
 	// Watch for secret changes
 	go p.watchSecrets(ctx, clientset, labelSelector)
 
-	// Sync secrets periodically as a backup mechanism
-	ticker := time.NewTicker(PollInterval)
-	defer ticker.Stop()
+	return nil
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			if err := p.syncSecrets(ctx); err != nil {
-				p.log.Error(err, "failed to sync secrets")
-			}
+// Reconcile implements the controller-runtime Reconciler interface
+func (p *KubeconfigProvider) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	log := p.log.WithValues("secret", req.NamespacedName)
+	secret := &corev1.Secret{}
+
+	if err := p.Client.Get(ctx, req.NamespacedName, secret); err != nil {
+		if errors.IsNotFound(err) {
+			log.Info("Secret not found, handling deletion")
+			// Secret was deleted, handle deletion
+			p.handleSecretDelete(&corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      req.Name,
+					Namespace: req.Namespace,
+				},
+			})
+			return reconcile.Result{}, nil
 		}
+		log.Error(err, "Failed to get secret")
+		return reconcile.Result{}, fmt.Errorf("failed to get secret: %w", err)
 	}
+
+	log.Info("Processing secret")
+	// Handle secret update/creation
+	p.handleSecretUpsert(ctx, secret)
+
+	return reconcile.Result{}, nil
 }
 
 // IndexField indexes a field on all clusters, existing and future.
@@ -231,6 +254,256 @@ func (p *KubeconfigProvider) IndexField(ctx context.Context, obj client.Object, 
 	}
 
 	return nil
+}
+
+// Engage creates, starts and registers a new cluster with the manager
+func (p *KubeconfigProvider) Engage(ctx context.Context, clusterName string, config *rest.Config) error {
+	log := p.log.WithValues("cluster", clusterName)
+	log.Info("Creating new controller-runtime cluster")
+
+	// Add timeout to the config
+	config.Timeout = ConnectionTimeout
+
+	// Use provided scheme or create a new one
+	s := p.opts.Scheme
+	if s == nil {
+		s = runtime.NewScheme()
+		_ = corev1.AddToScheme(s) // Add core types
+	}
+
+	// Create options with our scheme
+	options := cluster.Options{
+		Scheme: s,
+	}
+
+	// Combine with any other options
+	if len(p.opts.ClusterOptions) > 0 {
+		for _, opt := range p.opts.ClusterOptions {
+			opt(&options)
+		}
+	}
+
+	// Convert Options back to Option functions
+	opts := []cluster.Option{
+		func(o *cluster.Options) {
+			*o = options
+		},
+	}
+
+	// Create the cluster with our scheme
+	cl, err := cluster.New(config, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to create cluster: %w", err)
+	}
+
+	// Apply indexers to new cluster
+	p.lock.RLock()
+	indexers := make([]index, len(p.indexers))
+	copy(indexers, p.indexers)
+	p.lock.RUnlock()
+
+	for _, idx := range indexers {
+		if err := cl.GetCache().IndexField(ctx, idx.object, idx.field, idx.extractValue); err != nil {
+			return fmt.Errorf("failed to index field %q: %w", idx.field, err)
+		}
+	}
+
+	// Create new context for this cluster
+	clusterCtx, cancel := context.WithCancel(ctx)
+
+	// Start the cluster
+	log.Info("Starting cluster client")
+	go func() {
+		if err := cl.Start(clusterCtx); err != nil {
+			log.Error(err, "failed to start cluster")
+			return
+		}
+	}()
+
+	// Wait for cache sync with a timeout
+	syncCtx, cancelSync := context.WithTimeout(ctx, CacheSyncTimeout)
+	defer cancelSync()
+
+	log.Info("Waiting for cache sync")
+	if !cl.GetCache().WaitForCacheSync(syncCtx) {
+		cancel()
+		return fmt.Errorf("failed to sync cache within timeout")
+	}
+	log.Info("Cache sync completed successfully")
+
+	// Test that the client works
+	testPods := &corev1.PodList{}
+	if err := cl.GetClient().List(ctx, testPods, client.InNamespace("default"), client.Limit(1)); err != nil {
+		log.Error(err, "cluster client test failed - couldn't list pods")
+		cancel()
+		return fmt.Errorf("cluster client test failed: %w", err)
+	}
+	log.Info("Cluster client test successful", "podsFound", len(testPods.Items))
+
+	// Add to our maps
+	p.lock.Lock()
+	p.clusters[clusterName] = cl
+	p.cancelFns[clusterName] = cancel
+	p.lock.Unlock()
+
+	// Engage with manager
+	p.lock.RLock()
+	mgr := p.manager
+	p.lock.RUnlock()
+
+	// If the provider hasn't been started yet
+	if mgr == nil {
+		cancel()
+		return fmt.Errorf("provider not initialized with manager")
+	}
+
+	log.Info("Engaging cluster with manager")
+	if err := mgr.Engage(ctx, clusterName, cl); err != nil {
+		cancel()
+		p.lock.Lock()
+		delete(p.clusters, clusterName)
+		delete(p.cancelFns, clusterName)
+		p.lock.Unlock()
+		return fmt.Errorf("failed to engage manager: %w", err)
+	}
+
+	log.Info("Successfully engaged cluster")
+	return nil
+}
+
+// handleSecretUpsert handles the addition or update of a kubeconfig secret
+func (p *KubeconfigProvider) handleSecretUpsert(ctx context.Context, secret *corev1.Secret) {
+	log := p.log.WithValues("secret", types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace})
+	log.Info("Processing kubeconfig secret")
+
+	clusterName := secret.Name
+
+	// Check if we already have this cluster
+	p.lock.RLock()
+	_, exists := p.clusters[clusterName]
+	existingCancelFn := p.cancelFns[clusterName]
+	p.lock.RUnlock()
+
+	// Get kubeconfig from secret
+	kubeconfigData, ok := secret.Data[p.opts.KubeconfigKey]
+	if !ok || len(kubeconfigData) == 0 {
+		log.Error(nil, "kubeconfig key not found or empty", "key", p.opts.KubeconfigKey)
+		return
+	}
+
+	log.Info("Found kubeconfig data in secret", "dataSize", len(kubeconfigData))
+
+	// Parse kubeconfig and create REST config
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
+	if err != nil {
+		log.Error(err, "failed to parse kubeconfig")
+		return
+	}
+
+	// Test connection to API server
+	log.Info("Testing connection to API server", "host", restConfig.Host)
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		log.Error(err, "failed to create clientset from config")
+		return
+	}
+
+	// Attempt to list nodes as a basic connectivity test
+	_, err = clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
+	if err != nil {
+		log.Error(err, "failed to connect to Kubernetes API server", "host", restConfig.Host)
+		return
+	}
+	log.Info("Successfully connected to API server", "host", restConfig.Host)
+
+	// If cluster exists and it's an update, we need to stop the old one
+	if exists {
+		log.Info("Updating existing cluster")
+		if existingCancelFn != nil {
+			existingCancelFn()
+		}
+		p.lock.Lock()
+		delete(p.clusters, clusterName)
+		delete(p.cancelFns, clusterName)
+		p.lock.Unlock()
+	}
+
+	// Create and start cluster
+	if err := p.Engage(ctx, clusterName, restConfig); err != nil {
+		log.Error(err, "failed to engage cluster")
+		return
+	}
+
+	// Log current cluster count
+	p.lock.RLock()
+	clusterCount := len(p.clusters)
+	p.lock.RUnlock()
+	log.Info("Currently managing clusters", "count", clusterCount)
+}
+
+// Disengage stops and removes a cluster from the provider
+func (p *KubeconfigProvider) Disengage(ctx context.Context, clusterName string) error {
+	log := p.log.WithValues("cluster", clusterName)
+	log.Info("Disengaging cluster")
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	// Find the cluster and cancel function
+	_, exists := p.clusters[clusterName]
+	if !exists {
+		return fmt.Errorf("cluster %s not found", clusterName)
+	}
+
+	// Get the cancel function
+	cancelFn, exists := p.cancelFns[clusterName]
+	if !exists {
+		return fmt.Errorf("cancel function for cluster %s not found", clusterName)
+	}
+
+	// Disengage from manager first
+	p.lock.RUnlock() // Temporarily unlock for manager call
+	p.lock.Lock()
+	mgr := p.manager
+	if mgr != nil {
+		if err := mgr.Disengage(ctx, clusterName); err != nil {
+			log.Error(err, "failed to disengage from manager")
+			// Continue with cleanup even if manager disengage fails
+		}
+	}
+	p.lock.Lock() // Lock again for cleanup
+
+	// Stop the cluster
+	cancelFn()
+
+	// Clean up our maps
+	delete(p.clusters, clusterName)
+	delete(p.cancelFns, clusterName)
+
+	log.Info("Successfully disengaged cluster")
+	return nil
+}
+
+// handleSecretDelete handles the deletion of a kubeconfig secret
+func (p *KubeconfigProvider) handleSecretDelete(secret *corev1.Secret) {
+	log := p.log.WithValues("secret", types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace})
+	log.Info("Handling kubeconfig secret deletion")
+
+	clusterName := secret.Name
+
+	// Use Disengage to handle cleanup
+	if err := p.Disengage(context.Background(), clusterName); err != nil {
+		if !strings.Contains(err.Error(), "not found") {
+			log.Error(err, "failed to disengage cluster")
+		}
+		return
+	}
+
+	// Log current cluster count
+	p.lock.RLock()
+	clusterCount := len(p.clusters)
+	p.lock.RUnlock()
+	log.Info("Currently managing clusters", "count", clusterCount)
 }
 
 // watchSecrets sets up a watch for secret changes
@@ -263,9 +536,6 @@ func (p *KubeconfigProvider) watchSecrets(ctx context.Context, clientset *kubern
 			case watch.Deleted:
 				p.handleSecretDelete(secret)
 			}
-
-			// Log managed clusters after each change
-			p.logManagedClusters()
 		}
 
 		// If we get here, the watch channel was closed, so we'll retry
@@ -316,247 +586,4 @@ func (p *KubeconfigProvider) syncSecrets(ctx context.Context) error {
 	p.lock.RUnlock()
 
 	return nil
-}
-
-// handleSecretUpsert handles the addition or update of a kubeconfig secret
-func (p *KubeconfigProvider) handleSecretUpsert(ctx context.Context, secret *corev1.Secret) {
-	log := p.log.WithValues("secret", types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace})
-	log.Info("Processing kubeconfig secret")
-
-	clusterName := secret.Name
-
-	// Check if we already have this cluster
-	p.lock.RLock()
-	_, exists := p.clusters[clusterName]
-	existingCancelFn := p.cancelFns[clusterName]
-	p.lock.RUnlock()
-
-	// Get kubeconfig from secret
-	kubeconfigData, ok := secret.Data[p.opts.KubeconfigKey]
-	if !ok || len(kubeconfigData) == 0 {
-		log.Error(nil, "kubeconfig key not found or empty", "key", p.opts.KubeconfigKey)
-		return
-	}
-
-	log.Info("Found kubeconfig data in secret", "dataSize", len(kubeconfigData))
-
-	// Parse kubeconfig and create REST config
-	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
-	if err != nil {
-		log.Error(err, "failed to parse kubeconfig")
-		return
-	}
-
-	// Test connection to API server
-	log.Info("Testing connection to API server", "host", restConfig.Host)
-	clientset, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		log.Error(err, "failed to create clientset from config")
-		return
-	}
-
-	// Attempt to list nodes as a basic connectivity test
-	_, err = clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
-	if err != nil {
-		log.Error(err, "failed to connect to Kubernetes API server", "host", restConfig.Host)
-		return
-	}
-	log.Info("Successfully connected to API server", "host", restConfig.Host)
-
-	// If cluster exists and it's an update, we need to stop the old one and create a new one
-	if exists {
-		log.Info("Updating existing cluster")
-		if existingCancelFn != nil {
-			existingCancelFn()
-		}
-		p.lock.Lock()
-		delete(p.clusters, clusterName)
-		delete(p.cancelFns, clusterName)
-		p.lock.Unlock()
-	}
-
-	// Create and start cluster
-	cl, err := p.createAndStartCluster(ctx, clusterName, restConfig, log)
-	if err != nil {
-		log.Error(err, "failed to create/start cluster")
-		return
-	}
-
-	// Engage with manager
-	if err := p.engageCluster(ctx, clusterName, cl); err != nil {
-		log.Error(err, "failed to engage cluster with manager")
-		return
-	}
-
-	log.Info("Successfully engaged cluster")
-}
-
-// handleSecretDelete handles the deletion of a kubeconfig secret
-func (p *KubeconfigProvider) handleSecretDelete(secret *corev1.Secret) {
-	log := p.log.WithValues("secret", types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace})
-	log.Info("Handling kubeconfig secret deletion")
-
-	clusterName := secret.Name
-
-	p.lock.Lock()
-	defer p.lock.Unlock()
-
-	// Find and stop the cluster if it exists
-	cancelFn, clusterExists := p.cancelFns[clusterName]
-	if !clusterExists {
-		return
-	}
-
-	// Cancel the context and cleanup
-	cancelFn()
-	delete(p.clusters, clusterName)
-	delete(p.cancelFns, clusterName)
-
-	log.Info("Disengaged cluster")
-}
-
-// createAndStartCluster creates a new controller-runtime cluster and starts it
-func (p *KubeconfigProvider) createAndStartCluster(ctx context.Context, clusterName string, config *rest.Config, log logr.Logger) (cluster.Cluster, error) {
-	// Create cluster
-	log.Info("Creating new controller-runtime cluster", "name", clusterName)
-
-	// Add timeout to the config
-	config.Timeout = ConnectionTimeout
-
-	// Create a scheme with our custom types
-	s := runtime.NewScheme()
-	schemeBuilder := &scheme.Builder{GroupVersion: crdv1alpha1.GroupVersion}
-	schemeBuilder.Register(&crdv1alpha1.FailoverGroup{}, &crdv1alpha1.FailoverGroupList{})
-	schemeBuilder.Register(&crdv1alpha1.Failover{}, &crdv1alpha1.FailoverList{})
-	_ = schemeBuilder.AddToScheme(s)
-	_ = corev1.AddToScheme(s) // Add core types
-
-	// Create options with our scheme
-	options := cluster.Options{
-		Scheme: s,
-	}
-
-	// Combine with any other options
-	if len(p.opts.ClusterOptions) > 0 {
-		for _, opt := range p.opts.ClusterOptions {
-			opt(&options)
-		}
-	}
-
-	// Convert Options back to Option functions
-	opts := []cluster.Option{
-		func(o *cluster.Options) {
-			*o = options
-		},
-	}
-
-	// Create the cluster with our scheme
-	cl, err := cluster.New(config, opts...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cluster: %w", err)
-	}
-
-	// Apply indexers to new cluster
-	p.lock.RLock()
-	indexers := make([]index, len(p.indexers))
-	copy(indexers, p.indexers)
-	p.lock.RUnlock()
-
-	for _, idx := range indexers {
-		if err := cl.GetCache().IndexField(ctx, idx.object, idx.field, idx.extractValue); err != nil {
-			return nil, fmt.Errorf("failed to index field %q: %w", idx.field, err)
-		}
-	}
-
-	// Create new context for this cluster
-	clusterCtx, cancel := context.WithCancel(ctx)
-
-	// Start the cluster
-	log.Info("Starting cluster client", "name", clusterName)
-	go func() {
-		if err := cl.Start(clusterCtx); err != nil {
-			log.Error(err, "failed to start cluster")
-			return
-		}
-	}()
-
-	// Wait for cache sync with a timeout
-	syncCtx, cancelSync := context.WithTimeout(ctx, CacheSyncTimeout)
-	defer cancelSync()
-
-	log.Info("Waiting for cache sync", "name", clusterName)
-	if !cl.GetCache().WaitForCacheSync(syncCtx) {
-		cancel()
-		return nil, fmt.Errorf("failed to sync cache within timeout")
-	}
-	log.Info("Cache sync completed successfully", "name", clusterName)
-
-	// Test that the client works
-	testPods := &corev1.PodList{}
-	if err := cl.GetClient().List(ctx, testPods, client.InNamespace("default"), client.Limit(1)); err != nil {
-		log.Error(err, "cluster client test failed - couldn't list pods", "name", clusterName)
-		cancel()
-		return nil, fmt.Errorf("cluster client test failed: %w", err)
-	}
-	log.Info("Cluster client test successful", "name", clusterName, "podsFound", len(testPods.Items))
-
-	// Add to our maps
-	p.lock.Lock()
-	p.clusters[clusterName] = cl
-	p.cancelFns[clusterName] = cancel
-	p.lock.Unlock()
-
-	return cl, nil
-}
-
-// engageCluster engages a cluster with the multicluster manager
-func (p *KubeconfigProvider) engageCluster(ctx context.Context, clusterName string, cl cluster.Cluster) error {
-	p.lock.RLock()
-	mgr := p.manager
-	p.lock.RUnlock()
-
-	// If the provider hasn't been started yet
-	if mgr == nil {
-		return fmt.Errorf("provider not initialized with manager")
-	}
-
-	p.log.Info("Engaging cluster with manager", "name", clusterName)
-
-	// Engage the manager with this cluster
-	if err := mgr.Engage(ctx, clusterName, cl); err != nil {
-		// Clean up on error
-		p.lock.Lock()
-		if cancelFn, exists := p.cancelFns[clusterName]; exists {
-			cancelFn()
-		}
-		delete(p.clusters, clusterName)
-		delete(p.cancelFns, clusterName)
-		p.lock.Unlock()
-
-		return fmt.Errorf("failed to engage manager: %w", err)
-	}
-
-	p.log.Info("Successfully engaged cluster with manager", "name", clusterName)
-	return nil
-}
-
-// logManagedClusters logs the list of all currently managed clusters
-func (p *KubeconfigProvider) logManagedClusters() {
-	p.lock.RLock()
-	defer p.lock.RUnlock()
-
-	if len(p.clusters) == 0 {
-		p.log.Info("No clusters are currently being managed")
-		return
-	}
-
-	// Get cluster names
-	clusterNames := make([]string, 0, len(p.clusters))
-	for name := range p.clusters {
-		clusterNames = append(clusterNames, name)
-	}
-
-	p.log.Info("Currently managing the following clusters",
-		"clusters", strings.Join(clusterNames, ", "),
-		"count", len(clusterNames))
 }

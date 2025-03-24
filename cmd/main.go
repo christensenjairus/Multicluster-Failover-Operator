@@ -208,6 +208,7 @@ func main() {
 	provider := kubeconfigs.New(mgr.GetClient(), kubeconfigs.Options{
 		Namespace:       namespace,
 		KubeconfigLabel: "sigs.k8s.io/multicluster-runtime-kubeconfig",
+		Scheme:          scheme,
 	})
 
 	// Create a multicluster reconciler
@@ -240,11 +241,7 @@ func main() {
 	go func() {
 		setupLog.Info("starting kubeconfig provider")
 		// Create a proper adapter that implements the Manager interface
-		managerAdapter := &KubeconfigClusterManager{
-			Client:     mgr.GetClient(),
-			clusters:   make(map[string]cluster.Cluster),
-			reconciler: mcReconciler,
-		}
+		managerAdapter := NewKubeconfigClusterManager(mgr, mcReconciler)
 		err := provider.Run(ctx, managerAdapter)
 		if err != nil {
 			setupLog.Error(err, "Error running provider")
@@ -289,10 +286,21 @@ func getOperatorNamespace() (string, error) {
 
 // KubeconfigClusterManager implements kubeconfigs.ClusterManager for cluster management
 type KubeconfigClusterManager struct {
+	manager.Manager
 	Client     client.Client
 	lock       sync.RWMutex
 	clusters   map[string]cluster.Cluster
 	reconciler *MulticlusterReconciler
+}
+
+// NewKubeconfigClusterManager creates a new KubeconfigClusterManager
+func NewKubeconfigClusterManager(mgr manager.Manager, reconciler *MulticlusterReconciler) *KubeconfigClusterManager {
+	return &KubeconfigClusterManager{
+		Manager:    mgr,
+		Client:     mgr.GetClient(),
+		clusters:   make(map[string]cluster.Cluster),
+		reconciler: reconciler,
+	}
 }
 
 // GetCluster returns the cluster with the given name.
@@ -335,6 +343,24 @@ func (a *KubeconfigClusterManager) Engage(ctx context.Context, name string, cl c
 		a.reconciler.ListClustersWithLog()
 	}
 
+	return nil
+}
+
+// Add implements manager.Manager
+func (a *KubeconfigClusterManager) Add(runnable manager.Runnable) error {
+	return nil
+}
+
+// Disengage removes a cluster from the manager
+func (a *KubeconfigClusterManager) Disengage(ctx context.Context, name string) error {
+	a.lock.Lock()
+	defer a.lock.Unlock()
+
+	if a.reconciler != nil {
+		a.reconciler.UnregisterCluster(name)
+	}
+
+	delete(a.clusters, name)
 	return nil
 }
 
@@ -416,4 +442,13 @@ func (r *MulticlusterReconciler) ListClustersWithLog() map[string]cluster.Cluste
 		"clusterNames", strings.Join(clusterNames, ", "))
 
 	return result
+}
+
+// UnregisterCluster removes a cluster from the reconciler
+func (r *MulticlusterReconciler) UnregisterCluster(name string) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	delete(r.clusters, name)
+	setupLog.Info("Unregistered cluster", "name", name)
 }
