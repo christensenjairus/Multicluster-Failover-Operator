@@ -29,6 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/multicluster"
 	"github.com/go-logr/logr"
 	// We're no longer using the multicluster-runtime directly in the controllers
 	// The main.go will handle setting up the controllers with mcbuilder
@@ -39,16 +40,7 @@ type FailoverGroupReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	// Optional reference to the multicluster reconciler
-	MCReconciler MulticlusterReconcilerInterface
-}
-
-// MulticlusterReconcilerInterface defines an interface for accessing multiple clusters
-type MulticlusterReconcilerInterface interface {
-	// ListClusters returns a list of all registered clusters
-	ListClusters() map[string]cluster.Cluster
-
-	// ListClustersWithLog returns a list of all registered clusters and logs them
-	ListClustersWithLog() map[string]cluster.Cluster
+	MCReconciler multicluster.MulticlusterReconcilerInterface
 }
 
 // ListClusters is a helper method that safely returns clusters or an empty map
