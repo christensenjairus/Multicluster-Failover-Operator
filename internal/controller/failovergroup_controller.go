@@ -29,7 +29,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
-	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/multicluster"
+	kubeconfig "github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfig"
 	"github.com/go-logr/logr"
 	// We're no longer using the multicluster-runtime directly in the controllers
 	// The main.go will handle setting up the controllers with mcbuilder
@@ -40,7 +40,7 @@ type FailoverGroupReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 	// Optional reference to the multicluster reconciler
-	MCReconciler multicluster.MulticlusterReconcilerInterface
+	MCReconciler *kubeconfig.MulticlusterReconciler
 }
 
 // ListClusters is a helper method that safely returns clusters or an empty map

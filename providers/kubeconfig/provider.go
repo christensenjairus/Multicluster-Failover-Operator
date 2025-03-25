@@ -41,8 +41,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/multicluster"
 )
 
 const (
@@ -89,18 +87,18 @@ type KubeconfigProvider struct {
 	client     client.Client
 	Client     client.Client // For controller-runtime Reconciler interface
 	lock       sync.RWMutex
-	manager    multicluster.ClusterManager
+	manager    KubeClusterManager
 	clusters   map[string]cluster.Cluster
 	cancelFns  map[string]context.CancelFunc
 	indexers   []index
 	seenHashes map[string]string // tracks resource versions
 }
 
-// Ensure KubeconfigProvider implements the multicluster.Provider interface
-var _ multicluster.Provider = &KubeconfigProvider{}
+// Ensure KubeconfigProvider implements the Provider interface
+var _ Provider = &KubeconfigProvider{}
 
 // New creates a new Kubeconfig Provider.
-func New(mgr multicluster.ClusterManager, opts Options) *KubeconfigProvider {
+func New(mgr KubeClusterManager, opts Options) *KubeconfigProvider {
 	// Set defaults
 	if opts.KubeconfigLabel == "" {
 		opts.KubeconfigLabel = DefaultKubeconfigSecretLabel
@@ -127,7 +125,7 @@ func New(mgr multicluster.ClusterManager, opts Options) *KubeconfigProvider {
 }
 
 // Get returns the cluster with the given name, if it is known.
-// It implements the multicluster.Provider interface.
+// It implements the Provider interface.
 func (p *KubeconfigProvider) Get(_ context.Context, clusterName string) (cluster.Cluster, error) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
@@ -140,8 +138,8 @@ func (p *KubeconfigProvider) Get(_ context.Context, clusterName string) (cluster
 }
 
 // Run starts the provider and blocks, watching for kubeconfig secrets.
-// It implements the multicluster.Provider interface.
-func (p *KubeconfigProvider) Run(ctx context.Context, mgr multicluster.ClusterManager) error {
+// It implements the Provider interface.
+func (p *KubeconfigProvider) Run(ctx context.Context, mgr KubeClusterManager) error {
 	p.log.Info("starting kubeconfig provider", "namespace", p.opts.Namespace, "label", p.opts.KubeconfigLabel)
 
 	p.lock.Lock()
@@ -219,7 +217,7 @@ func (p *KubeconfigProvider) Reconcile(ctx context.Context, req reconcile.Reques
 }
 
 // IndexField indexes a field on all clusters, existing and future.
-// It implements the multicluster.Provider interface.
+// It implements the Provider interface.
 func (p *KubeconfigProvider) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
