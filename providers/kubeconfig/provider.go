@@ -244,7 +244,7 @@ func (p *KubeconfigProvider) IndexField(ctx context.Context, obj client.Object, 
 // Engage creates, starts and registers a new cluster with the manager
 func (p *KubeconfigProvider) Engage(ctx context.Context, clusterName string, config *rest.Config) error {
 	log := p.log.WithValues("cluster", clusterName)
-	log.Info("creating new controller-runtime cluster")
+	log.Info("Creating new controller-runtime cluster")
 
 	// Add timeout to the config
 	config.Timeout = p.opts.ConnectionTimeout
@@ -263,7 +263,7 @@ func (p *KubeconfigProvider) Engage(ctx context.Context, clusterName string, con
 	// Start the cluster in a goroutine
 	go func() {
 		if err := cl.Start(clusterCtx); err != nil {
-			log.Error(err, "failed to start cluster")
+			log.Error(err, "Failed to start cluster")
 		}
 	}()
 
@@ -286,14 +286,14 @@ func (p *KubeconfigProvider) Engage(ctx context.Context, clusterName string, con
 		}
 	}
 
-	log.Info("successfully engaged cluster")
+	log.Info("Successfully engaged cluster")
 	return nil
 }
 
 // handleSecretUpsert handles the addition or update of a kubeconfig secret
 func (p *KubeconfigProvider) handleSecretUpsert(ctx context.Context, secret *corev1.Secret) {
 	log := p.log.WithValues("secret", types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace})
-	log.Info("processing kubeconfig secret")
+	log.Info("Processing kubeconfig secret")
 
 	clusterName := secret.Name
 
@@ -306,38 +306,38 @@ func (p *KubeconfigProvider) handleSecretUpsert(ctx context.Context, secret *cor
 	// Get kubeconfig from secret
 	kubeconfigData, ok := secret.Data[p.opts.KubeconfigKey]
 	if !ok || len(kubeconfigData) == 0 {
-		log.Error(nil, "kubeconfig key not found or empty", "key", p.opts.KubeconfigKey)
+		log.Error(nil, "Kubeconfig key not found or empty", "key", p.opts.KubeconfigKey)
 		return
 	}
 
-	log.Info("found kubeconfig data in secret", "dataSize", len(kubeconfigData))
+	log.Info("Found kubeconfig data in secret", "dataSize", len(kubeconfigData))
 
 	// Parse kubeconfig and create REST config
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
 	if err != nil {
-		log.Error(err, "failed to parse kubeconfig")
+		log.Error(err, "Failed to parse kubeconfig")
 		return
 	}
 
 	// Test connection to API server
-	log.Info("testing connection to api server", "host", restConfig.Host)
+	log.Info("Testing connection to API server", "host", restConfig.Host)
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		log.Error(err, "failed to create clientset from config")
+		log.Error(err, "Failed to create clientset from config")
 		return
 	}
 
 	// Attempt to list nodes as a basic connectivity test
 	_, err = clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
 	if err != nil {
-		log.Error(err, "failed to connect to kubernetes api server", "host", restConfig.Host)
+		log.Error(err, "Failed to connect to Kubernetes API server", "host", restConfig.Host)
 		return
 	}
-	log.Info("successfully connected to api server", "host", restConfig.Host)
+	log.Info("Successfully connected to API server", "host", restConfig.Host)
 
 	// If cluster exists and it's an update, we need to stop the old one
 	if exists {
-		log.Info("updating existing cluster")
+		log.Info("Updating existing cluster")
 		if existingCancelFn != nil {
 			existingCancelFn()
 		}
@@ -349,7 +349,7 @@ func (p *KubeconfigProvider) handleSecretUpsert(ctx context.Context, secret *cor
 
 	// Create and start cluster
 	if err := p.Engage(ctx, clusterName, restConfig); err != nil {
-		log.Error(err, "failed to engage cluster")
+		log.Error(err, "Failed to engage cluster")
 		return
 	}
 
@@ -357,13 +357,13 @@ func (p *KubeconfigProvider) handleSecretUpsert(ctx context.Context, secret *cor
 	p.lock.RLock()
 	clusterCount := len(p.clusters)
 	p.lock.RUnlock()
-	log.Info("currently managing clusters", "count", clusterCount)
+	log.Info("Currently managing clusters", "count", clusterCount)
 }
 
 // Disengage stops and removes a cluster from the provider
 func (p *KubeconfigProvider) Disengage(ctx context.Context, clusterName string) error {
 	log := p.log.WithValues("cluster", clusterName)
-	log.Info("disengaging cluster")
+	log.Info("Disengaging cluster")
 
 	p.lock.Lock()
 	defer p.lock.Unlock()
@@ -386,7 +386,7 @@ func (p *KubeconfigProvider) Disengage(ctx context.Context, clusterName string) 
 	mgr := p.manager
 	if mgr != nil {
 		if err := mgr.Disengage(ctx, clusterName); err != nil {
-			log.Error(err, "failed to disengage from manager")
+			log.Error(err, "Failed to disengage from manager")
 			// Continue with cleanup even if manager disengage fails
 		}
 	}
@@ -399,21 +399,21 @@ func (p *KubeconfigProvider) Disengage(ctx context.Context, clusterName string) 
 	delete(p.clusters, clusterName)
 	delete(p.cancelFns, clusterName)
 
-	log.Info("successfully disengaged cluster")
+	log.Info("Successfully disengaged cluster")
 	return nil
 }
 
 // handleSecretDelete handles the deletion of a kubeconfig secret
 func (p *KubeconfigProvider) handleSecretDelete(secret *corev1.Secret) {
 	log := p.log.WithValues("secret", types.NamespacedName{Name: secret.Name, Namespace: secret.Namespace})
-	log.Info("handling kubeconfig secret deletion")
+	log.Info("Handling kubeconfig secret deletion")
 
 	clusterName := secret.Name
 
 	// Use Disengage to handle cleanup
 	if err := p.Disengage(context.Background(), clusterName); err != nil {
 		if !strings.Contains(err.Error(), "not found") {
-			log.Error(err, "failed to disengage cluster")
+			log.Error(err, "Failed to disengage cluster")
 		}
 		return
 	}
@@ -422,7 +422,7 @@ func (p *KubeconfigProvider) handleSecretDelete(secret *corev1.Secret) {
 	p.lock.RLock()
 	clusterCount := len(p.clusters)
 	p.lock.RUnlock()
-	log.Info("currently managing clusters", "count", clusterCount)
+	log.Info("Currently managing clusters", "count", clusterCount)
 }
 
 // watchSecrets sets up a watch for secret changes

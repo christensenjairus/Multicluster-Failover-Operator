@@ -17,10 +17,13 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -30,9 +33,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -40,9 +43,15 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
-	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/multicluster"
 	kubeconfig "github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfig"
+
+	// Import multicluster-runtime packages
+
+	// +kubebuilder:scaffold:imports
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 var (
@@ -52,11 +61,10 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+
+	utilruntime.Must(crdv1alpha1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
-
-// ControllerSetupFunc is a function that sets up a controller with the manager
-type ControllerSetupFunc func(manager.Manager) error
 
 func main() {
 	var metricsAddr string
@@ -88,6 +96,7 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// Create config with explicitly provided kubeconfig/master
+	// Note: controller-runtime already handles the --kubeconfig flag
 	var config *rest.Config
 	var err error
 
@@ -105,19 +114,22 @@ func main() {
 	}
 
 	if masterURL != "" {
-		setupLog.Info("using explicitly provided master URL", "master", masterURL)
+		setupLog.Info("Using explicitly provided master URL", "master", masterURL)
+		// Use explicit master URL with kubeconfig if provided
 		if kubeconfigPath != "" {
-			setupLog.Info("using kubeconfig file with explicit master", "kubeconfig", kubeconfigPath)
+			setupLog.Info("Using kubeconfig file with explicit master", "kubeconfig", kubeconfigPath)
 			config, err = clientcmd.BuildConfigFromFlags(masterURL, kubeconfigPath)
 		} else {
+			// Just use the master URL
 			config = &rest.Config{
 				Host: masterURL,
 			}
 		}
 	} else {
-		setupLog.Info("using controller-runtime config handling")
+		// Use controller-runtime's standard config handling
+		setupLog.Info("Using controller-runtime config handling")
 		if kubeconfigPath != "" {
-			setupLog.Info("using kubeconfig file", "path", kubeconfigPath)
+			setupLog.Info("Using kubeconfig file", "path", kubeconfigPath)
 		}
 		config, err = ctrl.GetConfig()
 	}
@@ -127,9 +139,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("successfully connected to kubernetes api", "host", config.Host)
+	setupLog.Info("Successfully connected to Kubernetes API", "host", config.Host)
 
-	// Disable HTTP/2 if not explicitly enabled
+	// if the enable-http2 flag is false (the default), http/2 should be disabled
+	// due to its vulnerabilities. More specifically, disabling http/2 will
+	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
+	// Rapid Reset CVEs. For more information see:
+	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
+	// - https://github.com/advisories/GHSA-4374-p667-p6c8
 	disableHTTP2 := func(c *tls.Config) {
 		setupLog.Info("disabling http/2")
 		c.NextProtos = []string{"http/1.1"}
@@ -143,6 +160,7 @@ func main() {
 		TLSOpts: tlsOpts,
 	})
 
+	// Metrics endpoint options
 	metricsServerOptions := metricsserver.Options{
 		BindAddress:   metricsAddr,
 		SecureServing: secureMetrics,
@@ -153,6 +171,7 @@ func main() {
 		metricsServerOptions.FilterProvider = filters.WithAuthenticationAndAuthorization
 	}
 
+	// Get the root context for the whole application
 	ctx := ctrl.SetupSignalHandler()
 
 	// Determine the namespace for kubeconfig discovery
@@ -174,24 +193,60 @@ func main() {
 		LeaderElectionID:       "cb9167b4.hahomelabs.com",
 	}
 
-	// Create a standard controller-runtime manager
+	// First, create a standard controller-runtime manager
+	// This is for the conventional controller approach
 	mgr, err := ctrl.NewManager(config, mgmtOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	// Create the multicluster manager
-	mcManager := multicluster.NewMulticlusterManager(mgr)
-
+	// Now let's set up the multicluster part
 	// Create the kubeconfig provider for multicluster discovery
-	provider := kubeconfig.New(mcManager, kubeconfig.Options{
-		Namespace:         namespace,
+	mcReconciler := &MulticlusterReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		clusters: make(map[string]cluster.Cluster),
+	}
+
+	provider := kubeconfig.New(NewKubeconfigClusterManager(mgr, mcReconciler), kubeconfig.Options{
+		Namespace:         namespace, // Explicitly set the namespace from getOperatorNamespace()
 		KubeconfigLabel:   "sigs.k8s.io/multicluster-runtime-kubeconfig",
 		Scheme:            scheme,
 		ConnectionTimeout: 10 * time.Second,
 		CacheSyncTimeout:  30 * time.Second,
 	})
+
+	// Now we set up the controller in the standard way first
+	if err := (&controller.FailoverGroupReconciler{
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		MCReconciler: mcReconciler,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create failovergroup controller", "controller", "FailoverGroup")
+		os.Exit(1)
+	}
+
+	if err := (&controller.FailoverReconciler{
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		MCReconciler: mcReconciler,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create failover controller", "controller", "Failover")
+		os.Exit(1)
+	}
+
+	// Start the provider in a background goroutine
+	go func() {
+		setupLog.Info("starting kubeconfig provider")
+		// Create a proper adapter that implements the Manager interface
+		managerAdapter := NewKubeconfigClusterManager(mgr, mcReconciler)
+		err := provider.Run(ctx, managerAdapter)
+		if err != nil {
+			setupLog.Error(err, "Error running provider")
+			os.Exit(1)
+		}
+	}()
 
 	// Setup healthz/readyz checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -200,22 +255,6 @@ func main() {
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
-	}
-
-	// Start the provider in a background goroutine
-	go func() {
-		setupLog.Info("starting kubeconfig provider")
-		err := provider.Run(ctx, mcManager)
-		if err != nil {
-			setupLog.Error(err, "error running provider")
-			os.Exit(1)
-		}
-	}()
-
-	// Setup controllers
-	if err := controller.SetupControllers(mcManager); err != nil {
-		setupLog.Error(err, "unable to setup controllers")
 		os.Exit(1)
 	}
 
@@ -242,4 +281,212 @@ func getOperatorNamespace() (string, error) {
 
 	// Default to the standard operator namespace
 	return "multicluster-failover-operator-system", nil
+}
+
+// ClusterManager defines an interface for managing multiple clusters
+type ClusterManager interface {
+	manager.Manager
+
+	// GetCluster returns a cluster for the given name
+	GetCluster(ctx context.Context, name string) (cluster.Cluster, error)
+
+	// Engage registers a new cluster with the manager
+	Engage(ctx context.Context, name string, cl cluster.Cluster) error
+
+	// Disengage removes a cluster from the manager
+	Disengage(ctx context.Context, name string) error
+
+	// ListClusters returns a list of all registered clusters
+	ListClusters() map[string]cluster.Cluster
+
+	// ListClustersWithLog returns a list of all registered clusters and logs them
+	ListClustersWithLog() map[string]cluster.Cluster
+}
+
+// KubeconfigClusterManager is an implementation of the ClusterManager interface that manages
+// multiple Kubernetes clusters using kubeconfig.
+type KubeconfigClusterManager struct {
+	manager.Manager
+	clusters   map[string]cluster.Cluster
+	reconciler *MulticlusterReconciler
+	mu         sync.RWMutex
+}
+
+// NewKubeconfigClusterManager creates a new KubeconfigClusterManager.
+func NewKubeconfigClusterManager(mgr manager.Manager, reconciler *MulticlusterReconciler) *KubeconfigClusterManager {
+	return &KubeconfigClusterManager{
+		Manager:    mgr,
+		clusters:   make(map[string]cluster.Cluster),
+		reconciler: reconciler,
+	}
+}
+
+// GetCluster returns a cluster by name.
+func (a *KubeconfigClusterManager) GetCluster(ctx context.Context, name string) (cluster.Cluster, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	c, ok := a.clusters[name]
+	if !ok {
+		return nil, fmt.Errorf("cluster %s not found", name)
+	}
+	return c, nil
+}
+
+// Engage adds a cluster to the manager.
+func (a *KubeconfigClusterManager) Engage(ctx context.Context, name string, c cluster.Cluster) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.clusters[name] = c
+	a.reconciler.RegisterCluster(name, c)
+	return nil
+}
+
+// Disengage removes a cluster from the manager.
+func (a *KubeconfigClusterManager) Disengage(ctx context.Context, name string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reconciler.UnregisterCluster(name)
+	delete(a.clusters, name)
+	return nil
+}
+
+// ListClusters returns a list of all registered clusters
+func (a *KubeconfigClusterManager) ListClusters() map[string]cluster.Cluster {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.clusters == nil {
+		return map[string]cluster.Cluster{}
+	}
+
+	// Return a copy of the map to prevent concurrent access
+	clusters := make(map[string]cluster.Cluster, len(a.clusters))
+	for name, cl := range a.clusters {
+		clusters[name] = cl
+	}
+	return clusters
+}
+
+// ListClustersWithLog returns a list of all registered clusters and logs them
+func (a *KubeconfigClusterManager) ListClustersWithLog() map[string]cluster.Cluster {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.clusters == nil {
+		setupLog.Info("No clusters registered")
+		return map[string]cluster.Cluster{}
+	}
+
+	// Log all clusters
+	clusterNames := make([]string, 0, len(a.clusters))
+	for name := range a.clusters {
+		clusterNames = append(clusterNames, name)
+	}
+	setupLog.Info("Current registered clusters",
+		"totalClusters", len(a.clusters),
+		"clusterNames", strings.Join(clusterNames, ", "))
+
+	// Return a copy of the map to prevent concurrent access
+	clusters := make(map[string]cluster.Cluster, len(a.clusters))
+	for name, cl := range a.clusters {
+		clusters[name] = cl
+	}
+	return clusters
+}
+
+// MulticlusterReconciler handles reconciliations across multiple clusters
+type MulticlusterReconciler struct {
+	Client   client.Client
+	Scheme   *runtime.Scheme
+	lock     sync.RWMutex
+	clusters map[string]cluster.Cluster
+}
+
+// RegisterCluster registers a new cluster with the reconciler
+func (r *MulticlusterReconciler) RegisterCluster(name string, cl cluster.Cluster) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	setupLog.Info("Registering cluster with reconciler", "name", name)
+
+	if r.clusters == nil {
+		r.clusters = make(map[string]cluster.Cluster)
+	}
+
+	// Store the cluster
+	r.clusters[name] = cl
+	setupLog.Info("Registered cluster with reconciler", "name", name, "totalClusters", len(r.clusters))
+
+	// Log all clusters after registration
+	clusterNames := make([]string, 0, len(r.clusters))
+	for name := range r.clusters {
+		clusterNames = append(clusterNames, name)
+	}
+	setupLog.Info("Current clusters after registration",
+		"totalClusters", len(r.clusters),
+		"clusterNames", strings.Join(clusterNames, ", "))
+}
+
+// UnregisterCluster removes a cluster from the reconciler
+func (r *MulticlusterReconciler) UnregisterCluster(name string) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	delete(r.clusters, name)
+	setupLog.Info("Unregistered cluster", "name", name)
+}
+
+// GetCluster returns a cluster for the given name
+func (r *MulticlusterReconciler) GetCluster(ctx context.Context, name string) (cluster.Cluster, error) {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	if cl, ok := r.clusters[name]; ok {
+		return cl, nil
+	}
+	return nil, fmt.Errorf("cluster %s not found", name)
+}
+
+// ListClusters returns a list of all registered clusters
+func (r *MulticlusterReconciler) ListClusters() map[string]cluster.Cluster {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	if r.clusters == nil {
+		return map[string]cluster.Cluster{}
+	}
+
+	// Return a copy of the map to prevent concurrent access
+	clusters := make(map[string]cluster.Cluster, len(r.clusters))
+	for name, cl := range r.clusters {
+		clusters[name] = cl
+	}
+	return clusters
+}
+
+// ListClustersWithLog returns a list of all registered clusters and logs them
+func (r *MulticlusterReconciler) ListClustersWithLog() map[string]cluster.Cluster {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	if r.clusters == nil {
+		setupLog.Info("No clusters registered")
+		return map[string]cluster.Cluster{}
+	}
+
+	// Log all clusters
+	clusterNames := make([]string, 0, len(r.clusters))
+	for name := range r.clusters {
+		clusterNames = append(clusterNames, name)
+	}
+	setupLog.Info("Current registered clusters",
+		"totalClusters", len(r.clusters),
+		"clusterNames", strings.Join(clusterNames, ", "))
+
+	// Return a copy of the map to prevent concurrent access
+	clusters := make(map[string]cluster.Cluster, len(r.clusters))
+	for name, cl := range r.clusters {
+		clusters[name] = cl
+	}
+	return clusters
 }

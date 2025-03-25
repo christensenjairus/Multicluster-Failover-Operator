@@ -161,7 +161,7 @@ func (r *FailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 
 	// If we're the target cluster, and there's a change, sync to other clusters
 	if (clusterName == failover.Spec.TargetCluster || (clusterName == "" && failover.Spec.TargetCluster == "")) && !syncMode {
-		// This cluster is the target one (or we're in the management cluster and no target cluster is specified)
+		// This cluster is the active one (or we're in the management cluster and no active cluster is specified)
 		// Now, let's synchronize this to all other clusters
 		go r.syncToOtherClusters(ctx, failover)
 	}
@@ -228,39 +228,46 @@ func (r *FailoverReconciler) syncToOtherClusters(ctx context.Context, failover *
 
 	// Get all clusters and sync to each non-target cluster
 	clusters := r.MCReconciler.ListClusters()
+	if len(clusters) == 0 {
+		logger.Info("No remote clusters available for failover")
+		return
+	}
+
+	logger.Info("Managing failover across clusters",
+		"clusterCount", len(clusters),
+		"targetCluster", failover.Spec.TargetCluster)
+
+	// Process the failover across all clusters
 	for clusterName, _ := range clusters {
-		// Skip the target cluster, no need to sync to itself
-		if clusterName == failover.Spec.TargetCluster {
-			continue
-		}
-
 		clusterLogger := logger.WithValues("targetCluster", clusterName)
-		clusterLogger.Info("Synchronizing Failover to non-target cluster")
+		isTarget := clusterName == failover.Spec.TargetCluster
 
-		// Get the target cluster
-		cl, err := r.MCReconciler.GetCluster(ctx, clusterName)
-		if err != nil {
-			clusterLogger.Error(err, "Failed to get target cluster")
-			continue
+		clusterLogger.Info("Processing cluster for failover",
+			"isTarget", isTarget)
+
+		// Process each FailoverGroup
+		for _, groupRef := range failover.Spec.FailoverGroups {
+			clusterLogger.Info("Processing FailoverGroup",
+				"name", groupRef.Name,
+				"namespace", groupRef.Namespace,
+				"status", groupRef.Status)
 		}
+	}
 
-		// Use the cluster client to sync the Failover
-		if err := cl.GetClient().Create(ctx, failover); err != nil {
-			clusterLogger.Error(err, "Failed to sync Failover to cluster")
-			continue
-		}
+	// Process the failover in a specific cluster
+	for clusterName, _ := range clusters {
+		isTarget := clusterName == failover.Spec.TargetCluster
 
-		// Call Reconcile with the sync context for each remote cluster
-		clusterCtx := context.WithValue(syncCtx, "clusterName", clusterName)
-		_, err = r.Reconcile(clusterCtx, ctrl.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      failover.Name,
-				Namespace: failover.Namespace,
-			},
-		})
+		logger.Info("Processing failover in specific cluster",
+			"cluster", clusterName,
+			"isTarget", isTarget)
 
-		if err != nil {
-			clusterLogger.Error(err, "Failed to synchronize Failover to non-target cluster")
+		// Process each FailoverGroup
+		for _, groupRef := range failover.Spec.FailoverGroups {
+			logger.Info("Processing FailoverGroup in cluster",
+				"name", groupRef.Name,
+				"namespace", groupRef.Namespace,
+				"status", groupRef.Status)
 		}
 	}
 }
@@ -284,7 +291,7 @@ func (r *FailoverReconciler) reconcileFailover(ctx context.Context, logger logr.
 		clusterLogger := logger.WithValues("targetCluster", clusterName)
 		isTarget := clusterName == failover.Spec.TargetCluster
 
-		clusterLogger.Info("Processing cluster for failover",
+		clusterLogger.Info("processing cluster for failover",
 			"isTarget", isTarget)
 
 		// Here you would implement the actual failover logic based on the target cluster
@@ -298,7 +305,7 @@ func (r *FailoverReconciler) reconcileFailover(ctx context.Context, logger logr.
 func (r *FailoverReconciler) reconcileFailoverInCluster(ctx context.Context, logger logr.Logger, failover *crdv1alpha1.Failover, clusterName string, targetClient client.Client) error {
 	isTarget := clusterName == failover.Spec.TargetCluster
 
-	logger.Info("Processing failover in specific cluster",
+	logger.Info("processing failover in specific cluster",
 		"cluster", clusterName,
 		"isTarget", isTarget)
 
@@ -353,19 +360,7 @@ func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
 	// Keep track of the last time we did a full reconciliation for each cluster
 	lastFullReconcileTime := make(map[string]time.Time)
 
-	setupWatchForCluster := func(clusterName string) {
-		// Get the cluster
-		cl, err := r.MCReconciler.GetCluster(ctx, clusterName)
-		if err != nil {
-			logger.Error(err, "Failed to get cluster", "cluster", clusterName)
-			return
-		}
-
-		if cl == nil || cl.GetClient() == nil {
-			logger.Error(nil, "Cluster client is nil", "cluster", clusterName)
-			return
-		}
-
+	setupWatchForCluster := func(clusterName string, cl cluster.Cluster) {
 		// Set up a watch for Failover resources in this cluster
 		clusterLogger := logger.WithValues("cluster", clusterName)
 		clusterLogger.Info("Setting up watch for Failover resources")
@@ -394,14 +389,22 @@ func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
 	}
 
 	checkClusters := func() {
+		// Get all registered clusters
+		clusters := r.ListClusters()
+		if len(clusters) == 0 {
+			return // No logging needed every time
+		}
+
 		// Check for new clusters
 		currentClusters := make(map[string]bool)
+		changesDetected := false
 
-		for _, clusterName := range []string{"cluster1", "cluster2"} { // Replace with actual cluster names
+		for clusterName, cl := range clusters {
 			currentClusters[clusterName] = true
 			if !watchedClusters[clusterName] {
-				setupWatchForCluster(clusterName)
+				setupWatchForCluster(clusterName, cl)
 				logger.Info("Added new cluster to watch list", "cluster", clusterName, "totalWatched", len(watchedClusters))
+				changesDetected = true
 			}
 		}
 
@@ -411,7 +414,13 @@ func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
 				delete(watchedClusters, clusterName)
 				delete(lastFullReconcileTime, clusterName)
 				logger.Info("Removed cluster from watch list", "cluster", clusterName, "totalWatched", len(watchedClusters))
+				changesDetected = true
 			}
+		}
+
+		// If clusters were added or removed, log the full list
+		if changesDetected && r.MCReconciler != nil {
+			r.MCReconciler.ListClustersWithLog()
 		}
 	}
 
