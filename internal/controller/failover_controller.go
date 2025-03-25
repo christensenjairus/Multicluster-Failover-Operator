@@ -18,18 +18,24 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
+	"fmt"
+	"strings"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	kubeconfig "github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfig"
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 )
 
 // FailoverReconciler reconciles a Failover object
@@ -47,6 +53,12 @@ type FailoverReconciler struct {
 // +kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers/finalizers,verbs=update
 func (r *FailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// Skip reconciliation if we're in startup mode and remote clusters might not be ready
+	if !r.waitForClustersReady(ctx) {
+		logger.Info("Skipping reconciliation during startup - waiting for clusters to be ready")
+		return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
+	}
 
 	// Check if we're dealing with a specific remote cluster
 	var clusterName string
@@ -117,35 +129,38 @@ func (r *FailoverReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// If we are not the target cluster and not in sync mode, check if we need to fetch the latest version from the target cluster
 	if clusterName != failover.Spec.TargetCluster && !syncMode && failover.Spec.TargetCluster != "" {
 		// Get the client for the target cluster
-		if r.MCReconciler != nil {
-			cl, err := r.MCReconciler.GetCluster(ctx, failover.Spec.TargetCluster)
-			if err != nil {
-				logger.Error(err, "Failed to get target cluster", "targetCluster", failover.Spec.TargetCluster)
-				return ctrl.Result{}, err
+		cl, err := r.GetCluster(ctx, logger, failover.Spec.TargetCluster)
+		if err != nil {
+			// Don't treat as an error - just log and move on with what we have
+			logger.Info("Skipping target cluster sync due to connectivity issue",
+				"targetCluster", failover.Spec.TargetCluster,
+				"error", err.Error())
+			// Return without error to allow requeue later
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		}
+
+		targetClusterClient := cl.GetClient()
+
+		// Get the Failover from the target cluster
+		targetFO := &crdv1alpha1.Failover{}
+		err = targetClusterClient.Get(ctx, req.NamespacedName, targetFO)
+		if err == nil {
+			// We found the resource in the target cluster, check if we need to update our local copy
+			if shouldUpdateFromTarget(failover, targetFO) {
+				logger.Info("Updating local Failover from target cluster",
+					"targetCluster", failover.Spec.TargetCluster,
+					"localResourceVersion", failover.ResourceVersion,
+					"targetResourceVersion", targetFO.ResourceVersion)
+
+				// Update our local copy with changes from the target cluster
+				syncCtx := context.WithValue(ctx, SyncModeKey, true)
+				syncCtx = context.WithValue(syncCtx, FailoverKey, targetFO)
+
+				// Call Reconcile with sync context
+				return r.Reconcile(syncCtx, req)
 			}
-			targetClusterClient := cl.GetClient()
-
-			// Get the Failover from the target cluster
-			targetFO := &crdv1alpha1.Failover{}
-			err = targetClusterClient.Get(ctx, req.NamespacedName, targetFO)
-			if err == nil {
-				// We found the resource in the target cluster, check if we need to update our local copy
-				if shouldUpdateFromTarget(failover, targetFO) {
-					logger.Info("Updating local Failover from target cluster",
-						"targetCluster", failover.Spec.TargetCluster,
-						"localResourceVersion", failover.ResourceVersion,
-						"targetResourceVersion", targetFO.ResourceVersion)
-
-					// Update our local copy with changes from the target cluster
-					syncCtx := context.WithValue(ctx, SyncModeKey, true)
-					syncCtx = context.WithValue(syncCtx, FailoverKey, targetFO)
-
-					// Call Reconcile with sync context
-					return r.Reconcile(syncCtx, req)
-				}
-			} else if !errors.IsNotFound(err) {
-				logger.Error(err, "Error getting Failover from target cluster")
-			}
+		} else if !apierrors.IsNotFound(err) {
+			logger.Error(err, "Error getting Failover from target cluster")
 		}
 	}
 
@@ -220,7 +235,7 @@ func (r *FailoverReconciler) syncToOtherClusters(ctx context.Context, failover *
 		}, existingFailover)
 
 		if err != nil {
-			if errors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) {
 				// Doesn't exist, create it
 				logger.Info("Creating Failover in remote cluster", "cluster", clusterName)
 				newFailover := failover.DeepCopy()
@@ -269,7 +284,7 @@ func (r *FailoverReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return nil
 }
 
-// watchRemoteClusters sets up watchers on all remote clusters for Failover resources
+// watchRemoteClusters sets up watches on all remote clusters for Failover resources
 func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
 	// Wait a bit for the manager to start and the clusters to connect
 	time.Sleep(5 * time.Second)
@@ -279,10 +294,21 @@ func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
 
 	// Track which clusters we've set up watches for
 	watchedClusters := make(map[string]bool)
+	// Store cancel functions for each watch operation
+	watchCancels := make(map[string]context.CancelFunc)
 
 	// Set up a ticker to check for new clusters
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+
+	// Cleanup function for when we're done
+	defer func() {
+		// Cancel all watches
+		for name, cancel := range watchCancels {
+			logger.Info("Cancelling watch for cluster", "cluster", name)
+			cancel()
+		}
+	}()
 
 	for {
 		select {
@@ -302,13 +328,46 @@ func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
 					continue
 				}
 
-				// Create a new context for this cluster
-				clusterCtx := context.WithValue(ctx, ClusterNameKey, name)
+				// Create a new context for this cluster with cancel
+				clusterCtx, cancel := context.WithCancel(ctx)
+				clusterCtx = context.WithValue(clusterCtx, ClusterNameKey, name)
+				watchCancels[name] = cancel
+
+				// Test if the cluster cache is ready
+				clusterLogger := logger.WithValues("cluster", name)
+
+				// Create a timeout context just for testing cache readiness
+				testCtx, testCancel := context.WithTimeout(clusterCtx, 15*time.Second)
+
+				// Try to list a small resource to test if cache is synced
+				var nodes corev1.NodeList
+				cacheReady := true
+				if err := cl.GetClient().List(testCtx, &nodes, client.Limit(1)); err != nil {
+					if stderrors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "Timeout") {
+						clusterLogger.Info("Skipping cluster - cache not ready yet", "error", err.Error(), "timeout", "15s")
+						cacheReady = false
+					}
+				}
+				testCancel()
+
+				if !cacheReady {
+					// Try again later
+					cancel()
+					delete(watchCancels, name)
+					continue
+				}
 
 				// Queue a reconcile for any Failover resources in the new cluster
 				var failoverList crdv1alpha1.FailoverList
 				if err := cl.GetClient().List(clusterCtx, &failoverList); err != nil {
-					logger.Error(err, "Failed to list Failovers in remote cluster", "cluster", name)
+					if stderrors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "Timeout") {
+						clusterLogger.Info("Cache sync timeout when listing resources, will retry later")
+						cancel()
+						delete(watchCancels, name)
+						continue
+					}
+
+					clusterLogger.Error(err, "Failed to list Failovers in remote cluster")
 					continue
 				}
 
@@ -317,7 +376,18 @@ func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
 						"cluster", name,
 						"name", failover.Name,
 						"namespace", failover.Namespace)
+
+					// Actually queue a reconcile for this resource
+					r.Queue(reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Name:      failover.Name,
+							Namespace: failover.Namespace,
+						},
+					}, clusterCtx)
 				}
+
+				// Set up a watch for Failover resources in this cluster
+				go r.watchClusterResources(clusterCtx, name, cl)
 
 				// Mark this cluster as watched
 				watchedClusters[name] = true
@@ -328,7 +398,69 @@ func (r *FailoverReconciler) watchRemoteClusters(ctx context.Context) {
 			for name := range watchedClusters {
 				if _, exists := clusters[name]; !exists {
 					delete(watchedClusters, name)
+					if cancel, ok := watchCancels[name]; ok {
+						cancel()
+						delete(watchCancels, name)
+					}
 					logger.Info("Stopped watching cluster for Failover resources", "cluster", name)
+				}
+			}
+		}
+	}
+}
+
+// watchClusterResources sets up a continuous watch for resources in a specific cluster
+func (r *FailoverReconciler) watchClusterResources(ctx context.Context, clusterName string, cl cluster.Cluster) {
+	logger := log.FromContext(ctx).WithValues("cluster", clusterName, "operation", "watchClusterResources")
+	logger.Info("Starting resource polling for cluster")
+
+	// Map to track resource versions we've seen
+	resourceVersions := make(map[string]string)
+
+	// Poll every 5 seconds
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info("Polling terminated due to context cancellation")
+			return
+		case <-ticker.C:
+			// List all Failover resources in the cluster
+			var failoverList crdv1alpha1.FailoverList
+			if err := cl.GetClient().List(ctx, &failoverList); err != nil {
+				// Check if context was cancelled - this is a normal shutdown case
+				if stderrors.Is(err, context.Canceled) {
+					logger.Info("Context cancelled during list operation")
+					return
+				}
+
+				logger.Error(err, "Failed to list Failovers in remote cluster")
+				continue
+			}
+
+			// Check each resource
+			for _, failover := range failoverList.Items {
+				key := fmt.Sprintf("%s/%s", failover.Namespace, failover.Name)
+				// If we haven't seen this resource before or it's changed
+				if lastVersion, ok := resourceVersions[key]; !ok || lastVersion != failover.ResourceVersion {
+					logger.Info("Detected new or changed Failover",
+						"name", failover.Name,
+						"namespace", failover.Namespace,
+						"newResourceVersion", failover.ResourceVersion,
+						"oldResourceVersion", lastVersion)
+
+					// Update tracked version
+					resourceVersions[key] = failover.ResourceVersion
+
+					// Queue a reconcile
+					r.Queue(reconcile.Request{
+						NamespacedName: types.NamespacedName{
+							Name:      failover.Name,
+							Namespace: failover.Namespace,
+						},
+					}, ctx)
 				}
 			}
 		}
@@ -347,4 +479,88 @@ func (r *FailoverReconciler) reconcileFailoverInCluster(ctx context.Context, log
 	// This is where you would implement the Failover reconciliation logic for a remote cluster
 	logger.Info("Reconciling Failover in remote cluster")
 	return nil
+}
+
+// Queue enqueues a request with the proper context
+func (r *FailoverReconciler) Queue(request reconcile.Request, ctx context.Context) {
+	// Create a goroutine to handle the reconciliation
+	go func() {
+		logger := log.FromContext(ctx).WithValues(
+			"name", request.Name,
+			"namespace", request.Namespace)
+
+		logger.Info("Manually queuing reconcile for remote resource")
+
+		// Check if context is already cancelled before proceeding
+		select {
+		case <-ctx.Done():
+			logger.Info("Context cancelled, skipping reconciliation")
+			return
+		default:
+			// Proceed with reconciliation
+		}
+
+		// Call Reconcile directly with the preserved context
+		result, err := r.Reconcile(ctx, request)
+		if err != nil {
+			if stderrors.Is(err, context.Canceled) {
+				logger.Info("Reconciliation cancelled due to shutdown")
+			} else {
+				logger.Error(err, "Error reconciling remote resource")
+			}
+		} else if result.Requeue {
+			logger.Info("Resource needs to be requeued", "after", result.RequeueAfter)
+		}
+	}()
+}
+
+// GetCluster is a helper function that gracefully handles cluster connectivity issues
+func (r *FailoverReconciler) GetCluster(ctx context.Context, logger logr.Logger, clusterName string) (cluster.Cluster, error) {
+	if r.MCReconciler == nil {
+		return nil, fmt.Errorf("multicluster reconciler not available")
+	}
+
+	cl, err := r.MCReconciler.GetCluster(ctx, clusterName)
+	if err != nil {
+		logger.Error(err, "Failed to get remote cluster", "cluster", clusterName)
+		return nil, err
+	}
+
+	// Create a longer timeout context for testing cache readiness
+	// Increase timeout from 3 to 15 seconds to allow for slower Node informers
+	testCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	// Test if the cache is ready by trying to list a small resource
+	var nodes corev1.NodeList
+	if err := cl.GetClient().List(testCtx, &nodes, client.Limit(1)); err != nil {
+		if stderrors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "Timeout") {
+			logger.Info("Remote cluster cache not ready yet", "cluster", clusterName, "timeout", "15s")
+			return nil, fmt.Errorf("remote cluster cache not ready: %w", err)
+		}
+		// If it's a different error, it might still be fine - we at least got a response
+		logger.V(1).Info("Got response from remote cluster (error is expected)", "cluster", clusterName, "error", err)
+	}
+
+	logger.Info("Remote cluster ready", "cluster", clusterName)
+	return cl, nil
+}
+
+// waitForClustersReady checks if the multicluster reconciler is ready with all needed clusters
+func (r *FailoverReconciler) waitForClustersReady(ctx context.Context) bool {
+	// We need a multicluster reconciler
+	if r.MCReconciler == nil {
+		return true // No multicluster reconciler means we only do local reconciliation
+	}
+
+	// Check if clusters are available
+	clusters := r.MCReconciler.ListClusters()
+	if len(clusters) > 0 {
+		log.FromContext(ctx).V(1).Info("Multicluster reconciler has clusters",
+			"count", len(clusters))
+		return true
+	}
+
+	// No clusters yet, return false to trigger requeue
+	return false
 }

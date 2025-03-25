@@ -27,7 +27,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
 
-var setupLog = log.Log.WithName("kubeconfig")
+var setupLog = log.Log.WithName("kubeconfig-provider")
 
 // KubeconfigClusterManager is an implementation of the KubeClusterManager interface that manages
 // multiple Kubernetes clusters using kubeconfig.

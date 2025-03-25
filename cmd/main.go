@@ -17,7 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"os"
 	"strings"
@@ -167,6 +169,16 @@ func main() {
 	// Get the root context for the whole application
 	ctx := ctrl.SetupSignalHandler()
 
+	// Create a context with cancel for graceful shutdown of background tasks
+	ctxWithCancel, cancelFunc := context.WithCancel(ctx)
+
+	// Make sure to cancel all background processes when main context is done
+	go func() {
+		<-ctx.Done()
+		setupLog.Info("Main context cancelled, shutting down background tasks")
+		cancelFunc()
+	}()
+
 	// Determine the namespace for kubeconfig discovery
 	namespace, err := getOperatorNamespace()
 	if err != nil {
@@ -208,10 +220,51 @@ func main() {
 			Namespace:         namespace,
 			KubeconfigLabel:   "sigs.k8s.io/multicluster-runtime-kubeconfig",
 			Scheme:            scheme,
-			ConnectionTimeout: 10 * time.Second,
-			CacheSyncTimeout:  30 * time.Second,
+			ConnectionTimeout: 15 * time.Second,
+			CacheSyncTimeout:  60 * time.Second,
 		},
 	)
+
+	// Start the provider in a background goroutine and wait for initial discovery
+	providerReady := make(chan struct{})
+	go func() {
+		setupLog.Info("starting kubeconfig provider")
+
+		// Set the manager first before doing anything else
+		kubeconfigProvider.SetManager(clusterManager)
+
+		// First do an initial sync to discover clusters
+		if err := kubeconfigProvider.SyncSecrets(ctx); err != nil {
+			setupLog.Error(err, "initial secret sync failed", "error", err.Error())
+		} else {
+			setupLog.Info("Initial secret sync successful")
+		}
+
+		// Give time for clusters to be registered
+		time.Sleep(2 * time.Second)
+
+		// Signal that provider is ready
+		close(providerReady)
+
+		// Now run the continuous watch
+		err := kubeconfigProvider.Run(ctxWithCancel, clusterManager)
+		if err != nil && !errors.Is(err, context.Canceled) {
+			setupLog.Error(err, "Error running provider")
+			os.Exit(1)
+		}
+	}()
+
+	// Wait for the provider to be ready before setting up controllers
+	select {
+	case <-providerReady:
+		setupLog.Info("Kubeconfig provider ready, setting up controllers")
+	case <-time.After(30 * time.Second):
+		setupLog.Info("Timeout waiting for provider readiness, continuing anyway")
+	}
+
+	// Now let's add a small delay to allow cache to sync
+	setupLog.Info("Waiting for cache to sync before starting controllers...")
+	time.Sleep(5 * time.Second)
 
 	// Now we set up the controller in the standard way first
 	if err := (&controller.FailoverGroupReconciler{
@@ -231,16 +284,6 @@ func main() {
 		setupLog.Error(err, "unable to create failover controller", "controller", "Failover")
 		os.Exit(1)
 	}
-
-	// Start the provider in a background goroutine
-	go func() {
-		setupLog.Info("starting kubeconfig provider")
-		err := kubeconfigProvider.Run(ctx, clusterManager)
-		if err != nil {
-			setupLog.Error(err, "Error running provider")
-			os.Exit(1)
-		}
-	}()
 
 	// Setup healthz/readyz checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
