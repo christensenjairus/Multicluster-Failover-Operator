@@ -42,7 +42,7 @@ import (
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
-	kubeconfig "github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfig"
+	kubeconfig "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
 
 	// +kubebuilder:scaffold:imports
 	"k8s.io/client-go/rest"

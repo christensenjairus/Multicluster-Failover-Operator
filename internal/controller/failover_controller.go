@@ -33,9 +33,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
-	kubeconfig "github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfig"
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	kubeconfig "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
 )
 
 // FailoverReconciler reconciles a Failover object
