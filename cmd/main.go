@@ -233,20 +233,11 @@ func main() {
 		// Set the manager first before doing anything else
 		kubeconfigProvider.SetManager(clusterManager)
 
-		// First do an initial sync to discover clusters
-		if err := kubeconfigProvider.SyncSecrets(ctx); err != nil {
-			setupLog.Error(err, "initial secret sync failed", "error", err.Error())
-		} else {
-			setupLog.Info("Initial secret sync successful")
-		}
-
-		// Give time for clusters to be registered
-		time.Sleep(2 * time.Second)
-
-		// Signal that provider is ready
+		// Signal that we're going to start the provider
+		// This doesn't mean clusters are actually ready yet, just that we're starting
 		close(providerReady)
 
-		// Now run the continuous watch
+		// Run the provider - it will handle initial sync internally
 		err := kubeconfigProvider.Run(ctxWithCancel, clusterManager)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			setupLog.Error(err, "Error running provider")
@@ -254,16 +245,16 @@ func main() {
 		}
 	}()
 
-	// Wait for the provider to be ready before setting up controllers
+	// Wait for the provider to start
 	select {
 	case <-providerReady:
-		setupLog.Info("Kubeconfig provider ready, setting up controllers")
-	case <-time.After(30 * time.Second):
-		setupLog.Info("Timeout waiting for provider readiness, continuing anyway")
+		setupLog.Info("Kubeconfig provider starting...")
+	case <-time.After(5 * time.Second):
+		setupLog.Info("Timeout waiting for provider to start, continuing anyway")
 	}
 
-	// Now let's add a small delay to allow cache to sync
-	setupLog.Info("Waiting for cache to sync before starting controllers...")
+	// Now let's add a delay to allow provider to discover and connect to clusters
+	setupLog.Info("Waiting for provider to discover clusters...")
 	time.Sleep(5 * time.Second)
 
 	// Now we set up the controller in the standard way first

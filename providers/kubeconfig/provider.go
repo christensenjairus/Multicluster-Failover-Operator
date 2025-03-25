@@ -153,17 +153,16 @@ func (p *KubeconfigProvider) Run(ctx context.Context, mgr KubeClusterManager) er
 			return fmt.Errorf("timed out waiting for cache to sync")
 		}
 		p.log.Info("Controller-runtime cache is synced")
-
-		// Initial list of secrets using the now-synced cache
-		secretList := &corev1.SecretList{}
-		listErr := p.client.List(ctx, secretList, client.InNamespace(p.opts.Namespace), client.MatchingLabels{p.opts.KubeconfigLabel: "true"})
-		if listErr != nil {
-			p.log.Error(listErr, "Failed to list secrets from cache after sync")
-		} else {
-			p.log.Info("Listed secrets from cache after sync", "count", len(secretList.Items))
-		}
 	} else {
 		p.log.Info("No manager or cache available, skipping cache sync")
+	}
+
+	// Do initial sync using direct API call (not cached client)
+	if err := p.syncSecretsInternal(ctx); err != nil {
+		p.log.Error(err, "initial secret sync failed", "error", err.Error())
+		// Continue anyway - don't exit on sync failure
+	} else {
+		p.log.Info("Initial secret sync successful")
 	}
 
 	// Create a Kubernetes clientset for watching
@@ -515,20 +514,50 @@ func (p *KubeconfigProvider) watchSecrets(ctx context.Context, clientset *kubern
 					continue
 				}
 
+				// Check if we've already seen this exact version of the secret
+				key := fmt.Sprintf("%s/%s", secret.Namespace, secret.Name)
+				p.lock.RLock()
+				seenVersion, alreadySeen := p.seenHashes[key]
+				p.lock.RUnlock()
+
+				if alreadySeen && seenVersion == secret.ResourceVersion {
+					// We've already processed this exact version of the secret
+					p.log.V(1).Info("Skipping already processed secret version",
+						"secret", key,
+						"resourceVersion", secret.ResourceVersion)
+					continue
+				}
+
 				// Process the secret according to event type
 				switch event.Type {
 				case watch.Added, watch.Modified:
 					p.handleSecretUpsert(ctx, secret)
+					// Update the seen hash to avoid reprocessing
+					p.lock.Lock()
+					p.seenHashes[key] = secret.ResourceVersion
+					p.lock.Unlock()
 				case watch.Deleted:
 					p.handleSecretDelete(secret)
+					// Remove from seen hashes
+					p.lock.Lock()
+					delete(p.seenHashes, key)
+					p.lock.Unlock()
 				}
 			}
 		}
 	}
 }
 
-// SyncSecrets lists all matching secrets and processes them
+// SyncSecrets provides a public method to manually trigger a sync of all kubeconfig secrets
+// This is exposed for testing or forced refreshes, but normal operation uses the internal
+// sync during Run() initialization
 func (p *KubeconfigProvider) SyncSecrets(ctx context.Context) error {
+	return p.syncSecretsInternal(ctx)
+}
+
+// syncSecretsInternal lists all matching secrets and processes them
+// This is now a private implementation method used by both Run and the public SyncSecrets
+func (p *KubeconfigProvider) syncSecretsInternal(ctx context.Context) error {
 	// Create a direct Kubernetes clientset instead of using the cached client
 	config, err := rest.InClusterConfig()
 	if err != nil {
