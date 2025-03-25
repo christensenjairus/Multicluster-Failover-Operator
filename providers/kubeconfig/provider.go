@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package kubeconfigs provides a Kubernetes cluster provider that watches secrets
+// Package kubeconfig provides a Kubernetes cluster provider that watches secrets
 // containing kubeconfig data and creates controller-runtime clusters for each.
-package kubeconfigs
+package kubeconfig
 
 import (
 	"context"
@@ -37,11 +37,11 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
-	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/manager"
 	"github.com/multicluster-runtime/multicluster-runtime/pkg/multicluster"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -53,20 +53,6 @@ const (
 	// DefaultKubeconfigSecretKey is the default key in the secret data that contains the kubeconfig
 	DefaultKubeconfigSecretKey = "kubeconfig"
 )
-
-// ClusterManager defines the minimal interface needed for the KubeconfigProvider
-type ClusterManager interface {
-	controllerruntime.Manager
-
-	// GetCluster returns a cluster for the given name
-	GetCluster(ctx context.Context, name string) (cluster.Cluster, error)
-
-	// Engage registers a new cluster with the manager
-	Engage(ctx context.Context, name string, cl cluster.Cluster) error
-
-	// Disengage removes a cluster from the manager
-	Disengage(ctx context.Context, name string) error
-}
 
 // index defines a field indexer
 type index struct {
@@ -97,14 +83,14 @@ type Options struct {
 }
 
 // KubeconfigProvider is a cluster provider that watches for secrets containing kubeconfig data
-// and engages clusters based on those kubeconfigs.
+// and engages clusters based on those kubeconfig.
 type KubeconfigProvider struct {
 	opts       Options
 	log        logr.Logger
 	client     client.Client
 	Client     client.Client // For controller-runtime Reconciler interface
 	lock       sync.RWMutex
-	manager    ClusterManager
+	manager    manager.ClusterManager
 	clusters   map[string]cluster.Cluster
 	cancelFns  map[string]context.CancelFunc
 	indexers   []index
@@ -156,7 +142,7 @@ func (p *KubeconfigProvider) Get(_ context.Context, clusterName string) (cluster
 
 // Run starts the provider and blocks, watching for kubeconfig secrets.
 // It implements the multicluster.Provider interface.
-func (p *KubeconfigProvider) Run(ctx context.Context, mgr ClusterManager) error {
+func (p *KubeconfigProvider) Run(ctx context.Context, mgr manager.ClusterManager) error {
 	p.log.Info("Starting kubeconfig provider", "namespace", p.opts.Namespace, "label", p.opts.KubeconfigLabel)
 
 	p.lock.Lock()

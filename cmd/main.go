@@ -45,7 +45,7 @@ import (
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
-	"github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfigs"
+	kubeconfig "github.com/christensenjairus/Multicluster-Failover-Operator/providers/kubeconfig"
 
 	// Import multicluster-runtime packages
 
@@ -58,7 +58,7 @@ import (
 
 var (
 	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	setupLog = zap.New(zap.UseDevMode(true))
 )
 
 func init() {
@@ -205,7 +205,7 @@ func main() {
 
 	// Now let's set up the multicluster part
 	// Create the kubeconfig provider for multicluster discovery
-	provider := kubeconfigs.New(mgr.GetClient(), kubeconfigs.Options{
+	provider := kubeconfig.New(mgr.GetClient(), kubeconfig.Options{
 		Namespace:         namespace, // Explicitly set the namespace from getOperatorNamespace()
 		KubeconfigLabel:   "sigs.k8s.io/multicluster-runtime-kubeconfig",
 		Scheme:            scheme,
@@ -286,84 +286,115 @@ func getOperatorNamespace() (string, error) {
 	return "multicluster-failover-operator-system", nil
 }
 
-// KubeconfigClusterManager implements kubeconfigs.ClusterManager for cluster management
-type KubeconfigClusterManager struct {
+// ClusterManager defines an interface for managing multiple clusters
+type ClusterManager interface {
 	manager.Manager
-	Client     client.Client
-	lock       sync.RWMutex
-	clusters   map[string]cluster.Cluster
-	reconciler *MulticlusterReconciler
+
+	// GetCluster returns a cluster for the given name
+	GetCluster(ctx context.Context, name string) (cluster.Cluster, error)
+
+	// Engage registers a new cluster with the manager
+	Engage(ctx context.Context, name string, cl cluster.Cluster) error
+
+	// Disengage removes a cluster from the manager
+	Disengage(ctx context.Context, name string) error
+
+	// ListClusters returns a list of all registered clusters
+	ListClusters() map[string]cluster.Cluster
+
+	// ListClustersWithLog returns a list of all registered clusters and logs them
+	ListClustersWithLog() map[string]cluster.Cluster
 }
 
-// NewKubeconfigClusterManager creates a new KubeconfigClusterManager
+// KubeconfigClusterManager is an implementation of the ClusterManager interface that manages
+// multiple Kubernetes clusters using kubeconfig.
+type KubeconfigClusterManager struct {
+	manager.Manager
+	clusters   map[string]cluster.Cluster
+	reconciler *MulticlusterReconciler
+	mu         sync.RWMutex
+}
+
+// NewKubeconfigClusterManager creates a new KubeconfigClusterManager.
 func NewKubeconfigClusterManager(mgr manager.Manager, reconciler *MulticlusterReconciler) *KubeconfigClusterManager {
 	return &KubeconfigClusterManager{
 		Manager:    mgr,
-		Client:     mgr.GetClient(),
 		clusters:   make(map[string]cluster.Cluster),
 		reconciler: reconciler,
 	}
 }
 
-// GetCluster returns the cluster with the given name.
+// GetCluster returns a cluster by name.
 func (a *KubeconfigClusterManager) GetCluster(ctx context.Context, name string) (cluster.Cluster, error) {
-	a.lock.RLock()
-	defer a.lock.RUnlock()
-
-	if cl, exists := a.clusters[name]; exists {
-		setupLog.Info("Found existing cluster", "name", name)
-		return cl, nil
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	c, ok := a.clusters[name]
+	if !ok {
+		return nil, fmt.Errorf("cluster %s not found", name)
 	}
-	return nil, fmt.Errorf("cluster %s not found", name)
+	return c, nil
 }
 
-// Engage registers a new cluster with the adapter
-func (a *KubeconfigClusterManager) Engage(ctx context.Context, name string, cl cluster.Cluster) error {
-	a.lock.Lock()
-	defer a.lock.Unlock()
-
-	setupLog.Info("Engaging new cluster", "name", name)
-
-	// Store the cluster
-	if a.clusters == nil {
-		a.clusters = make(map[string]cluster.Cluster)
-	}
-	a.clusters[name] = cl
-
-	// Initialize the multicluster reconciler if needed
-	if a.reconciler != nil {
-		// Tell the reconciler about the new cluster
-		a.reconciler.RegisterCluster(name, cl)
-	} else {
-		setupLog.Error(nil, "Reconciler not initialized, can't register cluster", "name", name)
-	}
-
-	setupLog.Info("New cluster engaged", "name", name, "totalClusters", len(a.clusters))
-
-	// Log all clusters after a new one is added
-	if a.reconciler != nil {
-		a.reconciler.ListClustersWithLog()
-	}
-
+// Engage adds a cluster to the manager.
+func (a *KubeconfigClusterManager) Engage(ctx context.Context, name string, c cluster.Cluster) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.clusters[name] = c
+	a.reconciler.RegisterCluster(name, c)
 	return nil
 }
 
-// Add implements manager.Manager
-func (a *KubeconfigClusterManager) Add(runnable manager.Runnable) error {
-	return nil
-}
-
-// Disengage removes a cluster from the manager
+// Disengage removes a cluster from the manager.
 func (a *KubeconfigClusterManager) Disengage(ctx context.Context, name string) error {
-	a.lock.Lock()
-	defer a.lock.Unlock()
-
-	if a.reconciler != nil {
-		a.reconciler.UnregisterCluster(name)
-	}
-
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.reconciler.UnregisterCluster(name)
 	delete(a.clusters, name)
 	return nil
+}
+
+// ListClusters returns a list of all registered clusters
+func (a *KubeconfigClusterManager) ListClusters() map[string]cluster.Cluster {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.clusters == nil {
+		return map[string]cluster.Cluster{}
+	}
+
+	// Return a copy of the map to prevent concurrent access
+	clusters := make(map[string]cluster.Cluster, len(a.clusters))
+	for name, cl := range a.clusters {
+		clusters[name] = cl
+	}
+	return clusters
+}
+
+// ListClustersWithLog returns a list of all registered clusters and logs them
+func (a *KubeconfigClusterManager) ListClustersWithLog() map[string]cluster.Cluster {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if a.clusters == nil {
+		setupLog.Info("No clusters registered")
+		return map[string]cluster.Cluster{}
+	}
+
+	// Log all clusters
+	clusterNames := make([]string, 0, len(a.clusters))
+	for name := range a.clusters {
+		clusterNames = append(clusterNames, name)
+	}
+	setupLog.Info("Current registered clusters",
+		"totalClusters", len(a.clusters),
+		"clusterNames", strings.Join(clusterNames, ", "))
+
+	// Return a copy of the map to prevent concurrent access
+	clusters := make(map[string]cluster.Cluster, len(a.clusters))
+	for name, cl := range a.clusters {
+		clusters[name] = cl
+	}
+	return clusters
 }
 
 // MulticlusterReconciler handles reconciliations across multiple clusters
@@ -412,40 +443,6 @@ func (r *MulticlusterReconciler) RegisterCluster(name string, cl cluster.Cluster
 		"clusterNames", strings.Join(clusterNames, ", "))
 }
 
-// ListClusters returns a list of all registered clusters
-func (r *MulticlusterReconciler) ListClusters() map[string]cluster.Cluster {
-	r.lock.RLock()
-	defer r.lock.RUnlock()
-
-	result := make(map[string]cluster.Cluster, len(r.clusters))
-	for name, cl := range r.clusters {
-		result[name] = cl
-	}
-
-	return result
-}
-
-// ListClustersWithLog returns a list of all registered clusters and logs them
-func (r *MulticlusterReconciler) ListClustersWithLog() map[string]cluster.Cluster {
-	r.lock.RLock()
-	defer r.lock.RUnlock()
-
-	result := make(map[string]cluster.Cluster, len(r.clusters))
-	for name, cl := range r.clusters {
-		result[name] = cl
-	}
-
-	clusterNames := make([]string, 0, len(result))
-	for name := range result {
-		clusterNames = append(clusterNames, name)
-	}
-	setupLog.Info("Listing clusters from reconciler",
-		"totalClusters", len(result),
-		"clusterNames", strings.Join(clusterNames, ", "))
-
-	return result
-}
-
 // UnregisterCluster removes a cluster from the reconciler
 func (r *MulticlusterReconciler) UnregisterCluster(name string) {
 	r.lock.Lock()
@@ -453,4 +450,59 @@ func (r *MulticlusterReconciler) UnregisterCluster(name string) {
 
 	delete(r.clusters, name)
 	setupLog.Info("Unregistered cluster", "name", name)
+}
+
+// GetCluster returns a cluster for the given name
+func (r *MulticlusterReconciler) GetCluster(ctx context.Context, name string) (cluster.Cluster, error) {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	if cl, ok := r.clusters[name]; ok {
+		return cl, nil
+	}
+	return nil, fmt.Errorf("cluster %s not found", name)
+}
+
+// ListClusters returns a list of all registered clusters
+func (r *MulticlusterReconciler) ListClusters() map[string]cluster.Cluster {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	if r.clusters == nil {
+		return map[string]cluster.Cluster{}
+	}
+
+	// Return a copy of the map to prevent concurrent access
+	clusters := make(map[string]cluster.Cluster, len(r.clusters))
+	for name, cl := range r.clusters {
+		clusters[name] = cl
+	}
+	return clusters
+}
+
+// ListClustersWithLog returns a list of all registered clusters and logs them
+func (r *MulticlusterReconciler) ListClustersWithLog() map[string]cluster.Cluster {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	if r.clusters == nil {
+		setupLog.Info("No clusters registered")
+		return map[string]cluster.Cluster{}
+	}
+
+	// Log all clusters
+	clusterNames := make([]string, 0, len(r.clusters))
+	for name := range r.clusters {
+		clusterNames = append(clusterNames, name)
+	}
+	setupLog.Info("Current registered clusters",
+		"totalClusters", len(r.clusters),
+		"clusterNames", strings.Join(clusterNames, ", "))
+
+	// Return a copy of the map to prevent concurrent access
+	clusters := make(map[string]cluster.Cluster, len(r.clusters))
+	for name, cl := range r.clusters {
+		clusters[name] = cl
+	}
+	return clusters
 }
