@@ -43,11 +43,13 @@ import (
 
 func main() {
 	var namespace string
-	var kubeconfigLabel string
+	var kubeconfigSecretLabel string
+	var kubeconfigSecretKey string
 
 	flag.StringVar(&namespace, "namespace", "multicluster-failover-operator-system", "Namespace where kubeconfig secrets are stored")
-	flag.StringVar(&kubeconfigLabel, "kubeconfig-label", "sigs.k8s.io/multicluster-runtime-kubeconfig",
+	flag.StringVar(&kubeconfigSecretLabel, "kubeconfig-label", "sigs.k8s.io/multicluster-runtime-kubeconfig",
 		"Label used to identify secrets containing kubeconfig data")
+	flag.StringVar(&kubeconfigSecretKey, "kubeconfig-key", "kubeconfig", "Key in the secret data that contains the kubeconfig")
 
 	opts := zap.Options{
 		Development: true,
@@ -59,12 +61,13 @@ func main() {
 	entryLog := ctrllog.Log.WithName("entrypoint")
 	ctx := ctrl.SetupSignalHandler()
 
-	entryLog.Info("Starting application", "namespace", namespace, "kubeconfigLabel", kubeconfigLabel)
+	entryLog.Info("Starting application", "namespace", namespace, "kubeconfigSecretLabel", kubeconfigSecretLabel)
 
 	// Create the kubeconfig provider with options
 	providerOpts := kubeconfigprovider.Options{
-		Namespace:       namespace,
-		KubeconfigLabel: kubeconfigLabel,
+		Namespace:             namespace,
+		KubeconfigSecretLabel: kubeconfigSecretLabel,
+		KubeconfigSecretKey:   kubeconfigSecretKey,
 	}
 
 	// Create the provider first, then the manager with the provider

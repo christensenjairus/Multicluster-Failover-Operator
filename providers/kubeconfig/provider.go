@@ -52,14 +52,14 @@ var _ multicluster.Provider = &Provider{}
 // New creates a new Kubeconfig Provider.
 func New(opts Options) *Provider {
 	// Set defaults
-	if opts.KubeconfigLabel == "" {
-		opts.KubeconfigLabel = DefaultKubeconfigSecretLabel
+	if opts.KubeconfigSecretLabel == "" {
+		opts.KubeconfigSecretLabel = DefaultKubeconfigSecretLabel
 	}
-	if opts.KubeconfigKey == "" {
-		opts.KubeconfigKey = DefaultKubeconfigSecretKey
+	if opts.KubeconfigSecretKey == "" {
+		opts.KubeconfigSecretKey = DefaultKubeconfigSecretKey
 	}
-	if opts.KubeconfigPath == "" {
-		opts.KubeconfigPath = filepath.Join(os.Getenv("HOME"), ".kube", "config")
+	if opts.LocalKubeconfigPath == "" {
+		opts.LocalKubeconfigPath = filepath.Join(os.Getenv("HOME"), ".kube", "config")
 	}
 
 	return &Provider{
@@ -75,12 +75,12 @@ func New(opts Options) *Provider {
 type Options struct {
 	// Namespace is the namespace where kubeconfig secrets are stored.
 	Namespace string
-	// KubeconfigLabel is the label used to identify secrets containing kubeconfig data.
-	KubeconfigLabel string
-	// KubeconfigKey is the key in the secret data that contains the kubeconfig.
-	KubeconfigKey string
-	// KubeconfigPath is the path to kubeconfig file for test secrets.
-	KubeconfigPath string
+	// KubeconfigSecretLabel is the label used to identify secrets containing kubeconfig data.
+	KubeconfigSecretLabel string
+	// KubeconfigSecretKey is the key in the secret data that contains the kubeconfig.
+	KubeconfigSecretKey string
+	// LocalKubeconfigPath is the path to kubeconfig file for test secrets.
+	LocalKubeconfigPath string
 }
 
 type index struct {
@@ -116,7 +116,7 @@ func (p *Provider) Get(ctx context.Context, clusterName string) (cluster.Cluster
 // Run starts the provider and blocks, watching for kubeconfig secrets.
 func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 	log := p.log
-	log.Info("Starting kubeconfig provider", "namespace", p.opts.Namespace, "label", p.opts.KubeconfigLabel)
+	log.Info("Starting kubeconfig provider", "namespace", p.opts.Namespace, "label", p.opts.KubeconfigSecretLabel)
 
 	// If client isn't set yet, get it from the manager
 	if p.client == nil && mgr != nil {
@@ -142,7 +142,7 @@ func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 			}
 			// Only process secrets in our namespace with our label
 			return secret.Namespace == p.opts.Namespace &&
-				secret.Labels[p.opts.KubeconfigLabel] == "true"
+				secret.Labels[p.opts.KubeconfigSecretLabel] == "true"
 		},
 		Handler: toolscache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
@@ -186,9 +186,9 @@ func (p *Provider) handleSecret(ctx context.Context, secret *corev1.Secret, mgr 
 	log := p.log.WithValues("cluster", clusterName, "secret", fmt.Sprintf("%s/%s", secret.Namespace, secret.Name))
 
 	// Check if this secret has kubeconfig data
-	kubeconfigData, ok := secret.Data[p.opts.KubeconfigKey]
+	kubeconfigData, ok := secret.Data[p.opts.KubeconfigSecretKey]
 	if !ok {
-		log.Info("Secret does not contain kubeconfig data", "key", p.opts.KubeconfigKey)
+		log.Info("Secret does not contain kubeconfig data", "key", p.opts.KubeconfigSecretKey)
 		return nil
 	}
 
