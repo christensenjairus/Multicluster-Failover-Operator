@@ -15,7 +15,6 @@ import (
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
 	"k8s.io/apimachinery/pkg/api/errors"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
-	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
 )
 
@@ -28,10 +27,10 @@ type FailoverGroupReconciler struct {
 }
 
 // NewFailoverGroupReconciler creates a new FailoverGroupReconciler
-func NewFailoverGroupReconciler(mgr mcmanager.Manager, provider multicluster.Provider) *FailoverGroupReconciler {
+func NewFailoverGroupReconciler(mgr mcmanager.Manager) *FailoverGroupReconciler {
 	return &FailoverGroupReconciler{
 		Manager:  mgr,
-		Provider: provider.(*kubeconfigprovider.Provider),
+		Provider: mgr.GetProvider().(*kubeconfigprovider.Provider),
 		Log:      log.FromContext(context.Background()).WithName("failovergroup-reconciler"),
 	}
 }

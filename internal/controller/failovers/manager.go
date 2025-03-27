@@ -29,10 +29,10 @@ type FailoverReconciler struct {
 }
 
 // NewFailoverReconciler creates a new FailoverReconciler
-func NewFailoverReconciler(mgr mcmanager.Manager, provider *kubeconfigprovider.Provider) *FailoverReconciler {
+func NewFailoverReconciler(mgr mcmanager.Manager) *FailoverReconciler {
 	return &FailoverReconciler{
 		Manager:  mgr,
-		Provider: provider,
+		Provider: mgr.GetProvider().(*kubeconfigprovider.Provider),
 		Log:      log.FromContext(context.Background()).WithName("failover-reconciler"),
 	}
 }

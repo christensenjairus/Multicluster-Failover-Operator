@@ -20,13 +20,10 @@ package kubeconfig
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/go-logr/logr"
 
@@ -61,46 +58,28 @@ func New(opts Options) *Provider {
 	if opts.KubeconfigKey == "" {
 		opts.KubeconfigKey = DefaultKubeconfigSecretKey
 	}
-	if opts.ConnectionTimeout == 0 {
-		opts.ConnectionTimeout = 10 * time.Second
-	}
-	if opts.CacheSyncTimeout == 0 {
-		opts.CacheSyncTimeout = 30 * time.Second
-	}
 	if opts.KubeconfigPath == "" {
 		opts.KubeconfigPath = filepath.Join(os.Getenv("HOME"), ".kube", "config")
 	}
 
 	return &Provider{
-		opts:        opts,
-		log:         log.Log.WithName("kubeconfig-provider"),
-		client:      nil, // Will be set in Run
-		clusters:    map[string]cluster.Cluster{},
-		cancelFns:   map[string]context.CancelFunc{},
-		seenHashes:  map[string]string{},
-		readySignal: make(chan struct{}),
+		opts:      opts,
+		log:       log.Log.WithName("kubeconfig-provider"),
+		client:    nil, // Will be set in Run
+		clusters:  map[string]cluster.Cluster{},
+		cancelFns: map[string]context.CancelFunc{},
 	}
 }
 
-// Options are the options for the Kubeconfig Provider.
+// Options contains the configuration for the kubeconfig provider.
 type Options struct {
-	// Namespace to watch for kubeconfig secrets
+	// Namespace is the namespace where kubeconfig secrets are stored.
 	Namespace string
-
-	// Label key to identify kubeconfig secrets
+	// KubeconfigLabel is the label used to identify secrets containing kubeconfig data.
 	KubeconfigLabel string
-
-	// Key in the secret data that contains the kubeconfig
+	// KubeconfigKey is the key in the secret data that contains the kubeconfig.
 	KubeconfigKey string
-
-	// ConnectionTimeout is the timeout for connecting to a cluster
-	ConnectionTimeout time.Duration
-
-	// CacheSyncTimeout is the timeout for waiting for the cache to sync
-	CacheSyncTimeout time.Duration
-
-	// KubeconfigPath is the path to the kubeconfig file to use for development/testing
-	// If not set, will use the default ~/.kube/config
+	// KubeconfigPath is the path to kubeconfig file for test secrets.
 	KubeconfigPath string
 }
 
@@ -113,21 +92,13 @@ type index struct {
 // Provider is a cluster provider that watches for secrets containing kubeconfig data
 // and engages clusters based on those kubeconfigs.
 type Provider struct {
-	opts        Options
-	log         logr.Logger
-	client      client.Client
-	lock        sync.RWMutex
-	clusters    map[string]cluster.Cluster
-	cancelFns   map[string]context.CancelFunc
-	indexers    []index
-	seenHashes  map[string]string // tracks resource versions
-	readySignal chan struct{}     // Signal when provider is ready to start
-	readyOnce   sync.Once         // Ensure we only signal once
-}
-
-// IsReady returns a channel that will be closed when the provider is ready to start
-func (p *Provider) IsReady() <-chan struct{} {
-	return p.readySignal
+	opts      Options
+	log       logr.Logger
+	client    client.Client
+	lock      sync.RWMutex // protects everything below.
+	clusters  map[string]cluster.Cluster
+	cancelFns map[string]context.CancelFunc
+	indexers  []index
 }
 
 // Get returns the cluster with the given name, if it is known.
@@ -144,11 +115,12 @@ func (p *Provider) Get(ctx context.Context, clusterName string) (cluster.Cluster
 
 // Run starts the provider and blocks, watching for kubeconfig secrets.
 func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
-	p.log.Info("Starting kubeconfig provider", "namespace", p.opts.Namespace, "label", p.opts.KubeconfigLabel)
+	log := p.log
+	log.Info("Starting kubeconfig provider", "namespace", p.opts.Namespace, "label", p.opts.KubeconfigLabel)
 
 	// If client isn't set yet, get it from the manager
 	if p.client == nil && mgr != nil {
-		p.log.Info("Setting client from manager")
+		log.Info("Setting client from manager")
 		p.client = mgr.GetLocalManager().GetClient()
 		if p.client == nil {
 			return fmt.Errorf("failed to get client from manager")
@@ -175,21 +147,21 @@ func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 		Handler: toolscache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				secret := obj.(*corev1.Secret)
-				p.log.Info("Processing new secret", "name", secret.Name)
+				log.Info("Processing new secret", "name", secret.Name)
 				if err := p.handleSecret(ctx, secret, mgr); err != nil {
-					p.log.Error(err, "Failed to handle secret", "name", secret.Name)
+					log.Error(err, "Failed to handle secret", "name", secret.Name)
 				}
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
 				secret := newObj.(*corev1.Secret)
-				p.log.Info("Processing updated secret", "name", secret.Name)
+				log.Info("Processing updated secret", "name", secret.Name)
 				if err := p.handleSecret(ctx, secret, mgr); err != nil {
-					p.log.Error(err, "Failed to handle secret", "name", secret.Name)
+					log.Error(err, "Failed to handle secret", "name", secret.Name)
 				}
 			},
 			DeleteFunc: func(obj interface{}) {
 				secret := obj.(*corev1.Secret)
-				p.log.Info("Processing deleted secret", "name", secret.Name)
+				log.Info("Processing deleted secret", "name", secret.Name)
 				p.handleSecretDelete(secret)
 			},
 		},
@@ -197,15 +169,9 @@ func (p *Provider) Run(ctx context.Context, mgr mcmanager.Manager) error {
 		return fmt.Errorf("failed to add event handlers: %w", err)
 	}
 
-	// Signal readiness after setting up informer
-	p.readyOnce.Do(func() {
-		p.log.Info("Signaling that KubeconfigProvider is ready to start")
-		close(p.readySignal)
-	})
-
 	// Block until context is done
 	<-ctx.Done()
-	p.log.Info("Context cancelled, exiting provider")
+	log.Info("Context cancelled, exiting provider")
 	return ctx.Err()
 }
 
@@ -226,34 +192,17 @@ func (p *Provider) handleSecret(ctx context.Context, secret *corev1.Secret, mgr 
 		return nil
 	}
 
-	// Hash the kubeconfig to detect changes
-	dataHash := hashBytes(kubeconfigData)
-
-	// Check if we've seen this version before
-	p.lock.RLock()
-	existingHash, exists := p.seenHashes[clusterName]
-	p.lock.RUnlock()
-
-	if exists && existingHash == dataHash {
-		log.Info("Kubeconfig unchanged, skipping")
-		return nil
-	}
-
 	// Parse the kubeconfig
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigData)
 	if err != nil {
 		return fmt.Errorf("failed to parse kubeconfig: %w", err)
 	}
 
-	// Set reasonable defaults for the client
-	restConfig.Timeout = p.opts.ConnectionTimeout
-
-	// Check if we already have this cluster
+	// Check if cluster exists and remove it if it does
 	p.lock.RLock()
 	_, clusterExists := p.clusters[clusterName]
 	p.lock.RUnlock()
 
-	// If the cluster already exists, remove it first
 	if clusterExists {
 		log.Info("Cluster already exists, updating it")
 		if err := p.removeCluster(clusterName); err != nil {
@@ -269,11 +218,14 @@ func (p *Provider) handleSecret(ctx context.Context, secret *corev1.Secret, mgr 
 	}
 
 	// Apply any field indexers
+	p.lock.RLock()
 	for _, idx := range p.indexers {
 		if err := cl.GetFieldIndexer().IndexField(ctx, idx.object, idx.field, idx.extractValue); err != nil {
+			p.lock.RUnlock()
 			return fmt.Errorf("failed to index field %q: %w", idx.field, err)
 		}
 	}
+	p.lock.RUnlock()
 
 	// Create a context that will be canceled when this cluster is removed
 	clusterCtx, cancel := context.WithCancel(ctx)
@@ -285,21 +237,10 @@ func (p *Provider) handleSecret(ctx context.Context, secret *corev1.Secret, mgr 
 		}
 	}()
 
-	// Wait for cache to sync
-	log.Info("Waiting for cluster cache to sync", "timeout", p.opts.CacheSyncTimeout)
-	syncCtx, syncCancel := context.WithTimeout(ctx, p.opts.CacheSyncTimeout)
-	defer syncCancel()
-
-	if !cl.GetCache().WaitForCacheSync(syncCtx) {
-		cancel() // Cancel the cluster context
-		return fmt.Errorf("timeout waiting for cache to sync")
-	}
-
 	// Store the cluster
 	p.lock.Lock()
 	p.clusters[clusterName] = cl
 	p.cancelFns[clusterName] = cancel
-	p.seenHashes[clusterName] = dataHash
 	p.lock.Unlock()
 
 	log.Info("Successfully added cluster")
@@ -311,7 +252,6 @@ func (p *Provider) handleSecret(ctx context.Context, secret *corev1.Secret, mgr 
 			p.lock.Lock()
 			delete(p.clusters, clusterName)
 			delete(p.cancelFns, clusterName)
-			delete(p.seenHashes, clusterName)
 			p.lock.Unlock()
 			cancel() // Cancel the cluster context
 			return fmt.Errorf("failed to engage manager: %w", err)
@@ -368,7 +308,6 @@ func (p *Provider) removeCluster(clusterName string) error {
 	p.lock.Lock()
 	delete(p.clusters, clusterName)
 	delete(p.cancelFns, clusterName)
-	delete(p.seenHashes, clusterName)
 	p.lock.Unlock()
 
 	log.Info("Successfully removed cluster")
@@ -408,11 +347,4 @@ func (p *Provider) ListClusters() map[string]cluster.Cluster {
 		result[k] = v
 	}
 	return result
-}
-
-// hashBytes returns a hex-encoded SHA256 hash of the given bytes
-func hashBytes(data []byte) string {
-	h := sha256.New()
-	h.Write(data)
-	return hex.EncodeToString(h.Sum(nil))
 }
