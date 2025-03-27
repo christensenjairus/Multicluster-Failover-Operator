@@ -25,6 +25,7 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	"k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	// Import your controllers here <--------------------------------
+	"github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/cmd/controllers"
 
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -87,10 +89,18 @@ func main() {
 	// Create the multicluster manager with the provider
 	entryLog.Info("Creating manager")
 
+	// Add our API types to the scheme
+	if err := v1alpha1.AddToScheme(scheme.Scheme); err != nil {
+		entryLog.Error(err, "Failed to add API types to scheme")
+		os.Exit(1)
+	}
+
 	// Modify manager options to avoid waiting for cache sync
 	managerOpts := manager.Options{
 		// Don't block main thread on leader election
 		LeaderElection: false,
+		// Add the scheme
+		Scheme: scheme.Scheme,
 	}
 
 	mgr, err := mcmanager.New(ctrl.GetConfigOrDie(), provider, managerOpts)
@@ -103,9 +113,19 @@ func main() {
 	entryLog.Info("Adding controllers")
 
 	// TODO: Run your controllers here <--------------------------------
-	podWatcher := controllers.NewPodWatcher(mgr, provider)
-	if err := mgr.Add(podWatcher); err != nil {
-		entryLog.Error(err, "Unable to add pod watcher")
+	// podWatcher := controllers.NewPodWatcher(mgr, provider)
+	// if err := mgr.Add(podWatcher); err != nil {
+	// 	entryLog.Error(err, "Unable to add pod watcher")
+	// 	os.Exit(1)
+	// }
+	failoverGroupController := controllers.NewFailoverGroupReconciler(mgr, provider)
+	if err := mgr.Add(failoverGroupController); err != nil {
+		entryLog.Error(err, "Unable to add failover group controller")
+		os.Exit(1)
+	}
+	failoverController := controllers.NewFailoverReconciler(mgr, provider)
+	if err := mgr.Add(failoverController); err != nil {
+		entryLog.Error(err, "Unable to add failover controller")
 		os.Exit(1)
 	}
 
