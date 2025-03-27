@@ -83,7 +83,9 @@ spec:
 ### Building the Operator
 
 ```
-go build -o bin/manager cmd/main.go
+make generate
+make manifests
+make build
 ```
 
 ### Running the Operator Locally
