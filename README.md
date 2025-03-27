@@ -44,21 +44,40 @@ kubectl apply -f config/samples/operator.yaml
 
 ## Usage
 
-1. Create a Secret with a kubeconfig for each cluster you want to manage:
+### Setting Up Cluster Access
 
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: cluster-1
-  namespace: multicluster-failover-operator-system
-  labels:
-    sigs.k8s.io/multicluster-runtime-kubeconfig: "true"
-data:
-  kubeconfig: BASE64_ENCODED_KUBECONFIG_HERE
+The operator needs access to each cluster it will manage. This includes both the local cluster and any remote clusters. You can use the provided script to set up access for any cluster:
+
+```bash
+# For the local cluster
+./scripts/create-kubeconfig-secret.sh -n local-cluster
+
+# For a remote cluster (assuming your kubectl context is set to the target cluster)
+kubectl config use-context remote-cluster
+./scripts/create-kubeconfig-secret.sh -n remote-cluster
 ```
 
-2. Create a FailoverGroup resource:
+The script will:
+1. Create necessary RBAC rules (ServiceAccount, ClusterRole, ClusterRoleBinding)
+2. Create a kubeconfig secret
+3. Verify the setup
+
+Options:
+- `-n, --name`: Name for the secret (will be used as cluster identifier)
+- `-s, --namespace`: Namespace to create the secret in (default: multicluster-failover-operator-system)
+- `-k, --kubeconfig`: Path to kubeconfig file (default: ~/.kube/config)
+- `-c, --context`: Kubeconfig context to use (default: current-context)
+- `-d, --dry-run`: Dry run, print YAML but don't apply
+- `--no-verify`: Skip verification step
+
+Example for a remote cluster:
+```bash
+./scripts/create-kubeconfig-secret.sh -n prod-cluster -c prod-context -k ~/.kube/prod-config
+```
+
+### Creating Failover Resources
+
+1. Create a FailoverGroup resource:
 
 ```yaml
 apiVersion: crd.hahomelabs.com/v1alpha1
@@ -76,7 +95,7 @@ spec:
     name: test-ingress
 ```
 
-3. The operator will reconcile this resource across all registered clusters.
+2. The operator will reconcile this resource across all registered clusters.
 
 ## Development
 
