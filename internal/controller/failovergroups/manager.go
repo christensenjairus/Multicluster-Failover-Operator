@@ -13,6 +13,7 @@ import (
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
+	"k8s.io/apimachinery/pkg/api/errors"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
@@ -136,32 +137,36 @@ func (r *FailoverGroupReconciler) setupWatch(ctx context.Context, cl cluster.Clu
 }
 
 // handleFailoverGroup processes a failover group event
-func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cluster.Cluster, group *crdv1alpha1.FailoverGroup) {
-	log := r.Log.WithValues("failovergroup", group.Name)
+func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cluster.Cluster, failoverGroup *crdv1alpha1.FailoverGroup) {
+	log := r.Log.WithValues("failovergroup", failoverGroup.Name)
 
 	// Initialize status if needed
-	if group.Status.Health == "" {
-		group.Status.Health = "OK"
-		group.Status.Suspended = group.Spec.Suspended
-		if err := cl.GetClient().Status().Update(ctx, group); err != nil {
-			log.Error(err, "Failed to update initial status")
+	if failoverGroup.Status.Health == "" {
+		failoverGroup.Status.Health = "OK"
+		failoverGroup.Status.Suspended = failoverGroup.Spec.Suspended
+		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update initial status")
+			}
 			return
 		}
 	}
 
 	// Update suspended status if changed
-	if group.Status.Suspended != group.Spec.Suspended {
-		group.Status.Suspended = group.Spec.Suspended
-		if err := cl.GetClient().Status().Update(ctx, group); err != nil {
-			log.Error(err, "Failed to update suspended status")
+	if failoverGroup.Status.Suspended != failoverGroup.Spec.Suspended {
+		failoverGroup.Status.Suspended = failoverGroup.Spec.Suspended
+		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update suspended status")
+			}
 			return
 		}
 	}
 
 	// Process workloads
-	for i, workload := range group.Spec.Workloads {
+	for i, workload := range failoverGroup.Spec.Workloads {
 		// Skip if already processed
-		if i < len(group.Status.Workloads) {
+		if i < len(failoverGroup.Status.Workloads) {
 			continue
 		}
 
@@ -171,11 +176,13 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 			Name:   workload.Name,
 			Health: "OK",
 		}
-		group.Status.Workloads = append(group.Status.Workloads, workloadStatus)
+		failoverGroup.Status.Workloads = append(failoverGroup.Status.Workloads, workloadStatus)
 
 		// Update status
-		if err := cl.GetClient().Status().Update(ctx, group); err != nil {
-			log.Error(err, "Failed to update workload status", "workload", workload.Name)
+		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update workload status", "workload", workload.Name)
+			}
 			return
 		}
 
@@ -187,9 +194,9 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 	}
 
 	// Process network resources
-	for i, resource := range group.Spec.NetworkResources {
+	for i, resource := range failoverGroup.Spec.NetworkResources {
 		// Skip if already processed
-		if i < len(group.Status.NetworkResources) {
+		if i < len(failoverGroup.Status.NetworkResources) {
 			continue
 		}
 
@@ -199,11 +206,13 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 			Name:   resource.Name,
 			Health: "OK",
 		}
-		group.Status.NetworkResources = append(group.Status.NetworkResources, resourceStatus)
+		failoverGroup.Status.NetworkResources = append(failoverGroup.Status.NetworkResources, resourceStatus)
 
 		// Update status
-		if err := cl.GetClient().Status().Update(ctx, group); err != nil {
-			log.Error(err, "Failed to update network resource status", "resource", resource.Name)
+		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update network resource status", "resource", resource.Name)
+			}
 			return
 		}
 
@@ -214,9 +223,9 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 	}
 
 	// Process Flux resources
-	for i, resource := range group.Spec.FluxResources {
+	for i, resource := range failoverGroup.Spec.FluxResources {
 		// Skip if already processed
-		if i < len(group.Status.FluxResources) {
+		if i < len(failoverGroup.Status.FluxResources) {
 			continue
 		}
 
@@ -226,11 +235,13 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 			Name:   resource.Name,
 			Health: "OK",
 		}
-		group.Status.FluxResources = append(group.Status.FluxResources, resourceStatus)
+		failoverGroup.Status.FluxResources = append(failoverGroup.Status.FluxResources, resourceStatus)
 
 		// Update status
-		if err := cl.GetClient().Status().Update(ctx, group); err != nil {
-			log.Error(err, "Failed to update Flux resource status", "resource", resource.Name)
+		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update Flux resource status", "resource", resource.Name)
+			}
 			return
 		}
 
@@ -241,23 +252,25 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 	}
 
 	// Update global state
-	if group.Status.GlobalState.ActiveCluster == "" {
+	if failoverGroup.Status.GlobalState.ActiveCluster == "" {
 		// TODO: Implement actual global state sync
 		// This would involve:
 		// 1. Syncing with DynamoDB
 		// 2. Updating cluster health status
 		// 3. Updating active cluster information
-		group.Status.GlobalState.DBSyncStatus = "Synced"
-		group.Status.GlobalState.LastSyncTime = time.Now().Format(time.RFC3339)
-		if err := cl.GetClient().Status().Update(ctx, group); err != nil {
-			log.Error(err, "Failed to update global state")
+		failoverGroup.Status.GlobalState.DBSyncStatus = "Synced"
+		failoverGroup.Status.GlobalState.LastSyncTime = time.Now().Format(time.RFC3339)
+		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update global state")
+			}
 			return
 		}
 	}
 
 	// Check overall health
 	allHealthy := true
-	for _, workload := range group.Status.Workloads {
+	for _, workload := range failoverGroup.Status.Workloads {
 		if workload.Health != "OK" {
 			allHealthy = false
 			break
@@ -265,14 +278,15 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 	}
 
 	if allHealthy {
-		group.Status.Health = "OK"
+		failoverGroup.Status.Health = "OK"
 	} else {
-		group.Status.Health = "DEGRADED"
+		failoverGroup.Status.Health = "DEGRADED"
 	}
 
-	if err := cl.GetClient().Status().Update(ctx, group); err != nil {
-		log.Error(err, "Failed to update overall health status")
-		return
+	if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
+		if !errors.IsConflict(err) {
+			log.V(2).Error(err, "Failed to update overall health status")
+		}
 	}
 }
 

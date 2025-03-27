@@ -69,7 +69,11 @@ func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName str
 			mirroredObj.SetUID("")
 			mirroredObj.SetResourceVersion("")
 			if err := targetCluster.GetClient().Create(ctx, mirroredObj); err != nil {
-				log.V(2).Error(err, "Failed to create mirrored object in target cluster", "targetCluster", clusterName)
+				if !errors.IsAlreadyExists(err) {
+					log.V(2).Error(err, "Failed to create mirrored object in target cluster", "targetCluster", clusterName)
+				} else {
+					log.V(2).Info("Object already exists in target cluster", "targetCluster", clusterName)
+				}
 				continue
 			}
 		} else {
@@ -80,6 +84,8 @@ func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName str
 				// Ignore concurrent modification errors as they are expected in mirroring scenarios
 				if !errors.IsConflict(err) {
 					log.V(2).Error(err, "Failed to update mirrored object in target cluster", "targetCluster", clusterName)
+				} else {
+					log.V(2).Info("Object was already updated by another process", "targetCluster", clusterName)
 				}
 				continue
 			}
