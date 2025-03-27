@@ -5,9 +5,7 @@ go 1.23.0
 toolchain go1.24.1
 
 // Replace the external multicluster-runtime with your local code
-//replace sigs.k8s.io/multicluster-runtime => github.com/christensenjairus/multicluster-runtime v0.1.0
-//replace sigs.k8s.io/multicluster-runtime => github.com/kubernetes-sigs/multicluster-runtime v0.20.0-alpha.5
-replace sigs.k8s.io/multicluster-runtime => ../multicluster-runtime
+replace sigs.k8s.io/multicluster-runtime => github.com/christensenjairus/multicluster-runtime v0.4.0
 
 require (
 	github.com/go-logr/logr v1.4.2

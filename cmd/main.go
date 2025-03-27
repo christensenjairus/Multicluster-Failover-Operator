@@ -31,8 +31,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	// Import your controllers here <--------------------------------
-	//"github.com/christensenjairus/Multicluster-Failover-Operator/cmd/controllers"
-
 	"github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller/failovergroups"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller/failovers"
@@ -100,12 +98,7 @@ func main() {
 	// Add our controllers
 	entryLog.Info("Adding controllers")
 
-	// TODO: Run your controllers here <--------------------------------
-	// podWatcher := controllers.NewPodWatcher(mgr)
-	// if err := mgr.Add(podWatcher); err != nil {
-	// 	entryLog.Error(err, "Unable to add pod watcher")
-	// 	os.Exit(1)
-	// }
+	// Run your controllers here <--------------------------------
 	failoverGroupController := failovergroups.NewFailoverGroupReconciler(mgr)
 	if err := mgr.Add(failoverGroupController); err != nil {
 		entryLog.Error(err, "Unable to add failover group controller")
