@@ -103,7 +103,7 @@ func main() {
 	entryLog.Info("Adding controllers")
 
 	// TODO: Run your controllers here <--------------------------------
-	podWatcher := controllers.NewPodWatcher(mgr)
+	podWatcher := controllers.NewPodWatcher(mgr, provider)
 	if err := mgr.Add(podWatcher); err != nil {
 		entryLog.Error(err, "Unable to add pod watcher")
 		os.Exit(1)
