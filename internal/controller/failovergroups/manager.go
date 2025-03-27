@@ -12,6 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
@@ -78,6 +79,12 @@ func (r *FailoverGroupReconciler) setupWatch(ctx context.Context, cl cluster.Clu
 		log.Info("Failover group",
 			"name", group.Name,
 			"health", group.Status.Health)
+	}
+
+	// Set up mirroring for FailoverGroups
+	if err := controller.SetupResourceMirroring(ctx, r.Provider, cl, clusterName, &crdv1alpha1.FailoverGroup{}); err != nil {
+		log.Error(err, "Failed to set up resource mirroring")
+		return err
 	}
 
 	// Get the informer for failover groups

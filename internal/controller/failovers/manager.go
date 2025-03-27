@@ -13,7 +13,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
 )
@@ -81,6 +83,12 @@ func (r *FailoverReconciler) setupWatch(ctx context.Context, cl cluster.Cluster,
 			"status", failover.Status.Status)
 	}
 
+	// Set up mirroring for Failovers
+	if err := controller.SetupResourceMirroring(ctx, r.Provider, cl, clusterName, &crdv1alpha1.Failover{}); err != nil {
+		log.Error(err, "Failed to set up resource mirroring")
+		return err
+	}
+
 	// Get the informer for failovers
 	informer, err := cl.GetCache().GetInformer(ctx, &crdv1alpha1.Failover{})
 	if err != nil {
@@ -138,7 +146,9 @@ func (r *FailoverReconciler) handleFailover(ctx context.Context, cl cluster.Clus
 		failover.Status.Status = "IN_PROGRESS"
 		failover.Status.State = "INITIALIZING"
 		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			log.Error(err, "Failed to update initial status")
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update initial status")
+			}
 			return
 		}
 	}
@@ -146,22 +156,26 @@ func (r *FailoverReconciler) handleFailover(ctx context.Context, cl cluster.Clus
 	// Get target cluster
 	targetCluster, err := r.Provider.Get(ctx, failover.Spec.TargetCluster)
 	if err != nil {
-		log.Error(err, "Failed to get target cluster", "cluster", failover.Spec.TargetCluster)
+		log.V(2).Error(err, "Failed to get target cluster", "cluster", failover.Spec.TargetCluster)
 		failover.Status.Status = "FAILED"
 		failover.Status.Message = fmt.Sprintf("Failed to get target cluster: %v", err)
 		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			log.Error(err, "Failed to update status")
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update status")
+			}
 		}
 		return
 	}
 
 	// Verify we can access the target cluster's API server
 	if err := targetCluster.GetClient().Get(ctx, client.ObjectKey{Namespace: "default", Name: "kube-system"}, &corev1.Namespace{}); err != nil {
-		log.Error(err, "Failed to access target cluster API server", "cluster", failover.Spec.TargetCluster)
+		log.V(2).Error(err, "Failed to access target cluster API server", "cluster", failover.Spec.TargetCluster)
 		failover.Status.Status = "FAILED"
 		failover.Status.Message = fmt.Sprintf("Failed to access target cluster API server: %v", err)
 		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			log.Error(err, "Failed to update status")
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update status")
+			}
 		}
 		return
 	}
@@ -180,7 +194,9 @@ func (r *FailoverReconciler) handleFailover(ctx context.Context, cl cluster.Clus
 
 		// Update status
 		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			log.Error(err, "Failed to update group status")
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update group status")
+			}
 			return
 		}
 
@@ -196,7 +212,9 @@ func (r *FailoverReconciler) handleFailover(ctx context.Context, cl cluster.Clus
 		group.Status = "SUCCESS"
 		group.CompletionTime = time.Now().Format(time.RFC3339)
 		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			log.Error(err, "Failed to update group completion status")
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update group completion status")
+			}
 			return
 		}
 	}
@@ -214,7 +232,9 @@ func (r *FailoverReconciler) handleFailover(ctx context.Context, cl cluster.Clus
 		failover.Status.Status = "SUCCESS"
 		failover.Status.Message = "All failover groups processed successfully"
 		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			log.Error(err, "Failed to update final status")
+			if !errors.IsConflict(err) {
+				log.V(2).Error(err, "Failed to update final status")
+			}
 		}
 	}
 }
