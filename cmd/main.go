@@ -44,13 +44,10 @@ import (
 func main() {
 	var namespace string
 	var kubeconfigLabel string
-	var kubeconfigPath string
 
 	flag.StringVar(&namespace, "namespace", "multicluster-failover-operator-system", "Namespace where kubeconfig secrets are stored")
 	flag.StringVar(&kubeconfigLabel, "kubeconfig-label", "sigs.k8s.io/multicluster-runtime-kubeconfig",
 		"Label used to identify secrets containing kubeconfig data")
-	flag.StringVar(&kubeconfigPath, "kubeconfig-path", "",
-		"Path to kubeconfig file for test secrets (defaults to ~/.kube/config if not set)")
 
 	opts := zap.Options{
 		Development: true,
@@ -68,7 +65,6 @@ func main() {
 	providerOpts := kubeconfigprovider.Options{
 		Namespace:       namespace,
 		KubeconfigLabel: kubeconfigLabel,
-		KubeconfigPath:  kubeconfigPath,
 	}
 
 	// Create the provider first, then the manager with the provider
