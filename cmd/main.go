@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -32,22 +34,32 @@ import (
 
 	// Import your controllers here <--------------------------------
 	"github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
+	internalconfig "github.com/christensenjairus/Multicluster-Failover-Operator/internal/config"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller/failovergroups"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller/failovers"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/redis"
 
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
 )
 
 func main() {
-	var namespace string
-	var kubeconfigSecretLabel string
-	var kubeconfigSecretKey string
+	var (
+		namespace             string
+		kubeconfigSecretLabel string
+		kubeconfigSecretKey   string
+		redisSecretName       string
+	)
 
 	flag.StringVar(&namespace, "namespace", "multicluster-failover-operator-system", "Namespace where kubeconfig secrets are stored")
 	flag.StringVar(&kubeconfigSecretLabel, "kubeconfig-label", "sigs.k8s.io/multicluster-runtime-kubeconfig",
 		"Label used to identify secrets containing kubeconfig data")
 	flag.StringVar(&kubeconfigSecretKey, "kubeconfig-key", "kubeconfig", "Key in the secret data that contains the kubeconfig")
+	flag.StringVar(&redisSecretName, "redis-secret-name", "redis-config", "Name of the Redis configuration secret")
+
+	// Initialize Redis configuration
+	redisConfig := &internalconfig.RedisConfig{}
+	redisConfig.AddFlags()
 
 	opts := zap.Options{
 		Development: true,
@@ -61,6 +73,31 @@ func main() {
 
 	entryLog.Info("Starting application", "namespace", namespace, "kubeconfigSecretLabel", kubeconfigSecretLabel)
 
+	// Load Redis configuration from secret
+	if err := redisConfig.LoadFromSecret(namespace, redisSecretName); err != nil {
+		entryLog.Info("Warning: Failed to load Redis configuration from secret", "error", err)
+	}
+
+	// Validate Redis configuration
+	if err := redisConfig.Validate(); err != nil {
+		entryLog.Error(err, "Invalid Redis configuration")
+		os.Exit(1)
+	}
+
+	// Create Redis manager
+	redisManager, err := redis.NewManager(redisConfig.ToRedisConfig(), entryLog)
+	if err != nil {
+		entryLog.Error(err, "Failed to create Redis manager")
+		os.Exit(1)
+	}
+	defer redisManager.Close()
+
+	// Create a channel for leader status
+	leaderChan := make(chan bool, 1)
+
+	// Start Redis leader election
+	redisManager.StartLeaderElection(ctx, 180*time.Second, leaderChan)
+
 	// Create the kubeconfig provider with options
 	providerOpts := kubeconfigprovider.Options{
 		Namespace:             namespace,
@@ -68,12 +105,8 @@ func main() {
 		KubeconfigSecretKey:   kubeconfigSecretKey,
 	}
 
-	// Create the provider first, then the manager with the provider
-	entryLog.Info("Creating provider")
+	// Create the provider and manager
 	provider := kubeconfigprovider.New(providerOpts)
-
-	// Create the multicluster manager with the provider
-	entryLog.Info("Creating manager")
 
 	// Add our API types to the scheme
 	if err := v1alpha1.AddToScheme(scheme.Scheme); err != nil {
@@ -94,11 +127,6 @@ func main() {
 		entryLog.Error(err, "Unable to create manager")
 		os.Exit(1)
 	}
-
-	// Add our controllers
-	entryLog.Info("Adding controllers")
-
-	// Run your controllers here <--------------------------------
 	failoverGroupController := failovergroups.NewFailoverGroupReconciler(mgr)
 	if err := mgr.Add(failoverGroupController); err != nil {
 		entryLog.Error(err, "Unable to add failover group controller")
@@ -110,19 +138,60 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Start provider in a goroutine
-	entryLog.Info("Starting provider")
+	// Create channels to control manager and provider
+	managerCtx, managerCancel := context.WithCancel(ctx)
+	providerCtx, providerCancel := context.WithCancel(ctx)
+
+	entryLog.Info("Acquiring leader lock...")
+
+	// Handle leadership changes
 	go func() {
-		err := provider.Run(ctx, mgr)
-		if err != nil && ctx.Err() == nil {
-			entryLog.Error(err, "Provider exited with error")
+		wasLeader := false
+		for {
+			select {
+			case <-ctx.Done():
+				entryLog.Info("Context cancelled, stopping manager and provider")
+				managerCancel()
+				providerCancel()
+				return
+			case isLeader := <-leaderChan:
+				if isLeader {
+					entryLog.Info("Acquired leadership, starting manager and provider")
+					// Start manager
+					go func() {
+						if err := mgr.Start(managerCtx); err != nil {
+							entryLog.Error(err, "Error running manager")
+						}
+					}()
+
+					// Wait for manager to initialize
+					entryLog.Info("Waiting for manager to initialize...")
+					time.Sleep(10 * time.Second) // Give the manager more time to initialize
+
+					// Start provider
+					entryLog.Info("Starting provider")
+					go func() {
+						if err := provider.Run(providerCtx, mgr); err != nil && providerCtx.Err() == nil {
+							entryLog.Error(err, "Provider exited with error")
+						}
+					}()
+					wasLeader = true
+				} else {
+					if wasLeader {
+						entryLog.Info("Lost leadership, stopping manager and provider")
+					}
+					managerCancel()
+					providerCancel()
+					// Create new contexts for next time
+					managerCtx, managerCancel = context.WithCancel(ctx)
+					providerCtx, providerCancel = context.WithCancel(ctx)
+					wasLeader = false
+				}
+			}
 		}
 	}()
 
-	// Start the manager
-	entryLog.Info("Starting manager")
-	if err := mgr.Start(ctx); err != nil {
-		entryLog.Error(err, "Error running manager")
-		os.Exit(1)
-	}
+	// Wait for context cancellation
+	<-ctx.Done()
+	entryLog.Info("Shutting down...")
 }
