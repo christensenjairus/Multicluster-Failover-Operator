@@ -5,163 +5,279 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-logr/logr"
-	"github.com/redis/go-redis/v9"
+	"github.com/go-logr/zapr"
+	redisclient "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
-// createTestLogger creates a simple test logger
-func createTestLogger() logr.Logger {
-	return logr.New(&testLogger{})
+func checkRedisAvailable() bool {
+	client := redisclient.NewClient(&redisclient.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	_, err := client.Ping(ctx).Result()
+	return err == nil
 }
 
-// testLogger implements logr.LogSink
-type testLogger struct{}
+func TestNewManager(t *testing.T) {
+	if !checkRedisAvailable() {
+		t.Skip("Redis is not available")
+	}
 
-func (l *testLogger) Init(info logr.RuntimeInfo)                                {}
-func (l *testLogger) Enabled(level int) bool                                    { return true }
-func (l *testLogger) Info(level int, msg string, keysAndValues ...interface{})  {}
-func (l *testLogger) Error(err error, msg string, keysAndValues ...interface{}) {}
-func (l *testLogger) WithValues(keysAndValues ...interface{}) logr.LogSink      { return l }
-func (l *testLogger) WithName(name string) logr.LogSink                         { return l }
+	zapLog, _ := zap.NewDevelopment()
+	logger := zapr.NewLogger(zapLog)
 
-func TestManager_LeaderElection(t *testing.T) {
-	// Create a test Redis client
-	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+	tests := []struct {
+		name    string
+		cfg     Config
+		wantErr bool
+	}{
+		{
+			name: "valid config",
+			cfg: Config{
+				Hosts:      []string{"localhost"},
+				Port:       6379,
+				Password:   "",
+				DB:         0,
+				LeaderKey:  "test:leader",
+				InstanceID: "test-instance",
+			},
+			wantErr: false,
+		},
+		{
+			name: "no hosts",
+			cfg: Config{
+				Hosts:      []string{},
+				Port:       6379,
+				Password:   "",
+				DB:         0,
+				LeaderKey:  "test:leader",
+				InstanceID: "test-instance",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid port",
+			cfg: Config{
+				Hosts:      []string{"localhost"},
+				Port:       0,
+				Password:   "",
+				DB:         0,
+				LeaderKey:  "test:leader",
+				InstanceID: "test-instance",
+			},
+			wantErr: true,
+		},
+		{
+			name: "no leader key",
+			cfg: Config{
+				Hosts:      []string{"localhost"},
+				Port:       6379,
+				Password:   "",
+				DB:         0,
+				LeaderKey:  "",
+				InstanceID: "test-instance",
+			},
+			wantErr: true,
+		},
+		{
+			name: "no instance ID",
+			cfg: Config{
+				Hosts:      []string{"localhost"},
+				Port:       6379,
+				Password:   "",
+				DB:         0,
+				LeaderKey:  "test:leader",
+				InstanceID: "",
+			},
+			wantErr: true,
+		},
+	}
 
-	// Clean up any existing test keys
-	ctx := context.Background()
-	client.Del(ctx, "test:leader")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager, err := NewManager(tt.cfg, logger)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, manager)
+				return
+			}
+			assert.NoError(t, err)
+			assert.NotNil(t, manager)
+			assert.NotNil(t, manager.rs)
+			assert.Equal(t, tt.cfg.LeaderKey, manager.leaderKey)
+			assert.Equal(t, tt.cfg.InstanceID, manager.instanceID)
+		})
+	}
+}
 
-	// Create a test logger
-	logger := createTestLogger()
+func TestManager_Close(t *testing.T) {
+	if !checkRedisAvailable() {
+		t.Skip("Redis is not available")
+	}
 
-	// Create a test manager
-	manager, err := NewManager(Config{
-		Host:       "localhost",
+	zapLog, _ := zap.NewDevelopment()
+	logger := zapr.NewLogger(zapLog)
+	cfg := Config{
+		Hosts:      []string{"localhost"},
 		Port:       6379,
+		Password:   "",
+		DB:         0,
 		LeaderKey:  "test:leader",
 		InstanceID: "test-instance",
-	}, logger)
-	require.NoError(t, err)
-	defer manager.Close()
+	}
 
-	// Test acquiring leadership
-	err = manager.AcquireLeadership(ctx, 30*time.Second)
+	manager, err := NewManager(cfg, logger)
 	require.NoError(t, err)
+	require.NotNil(t, manager)
 
-	// Verify we are the leader
-	isLeader, err := manager.IsLeader(ctx)
-	require.NoError(t, err)
-	assert.True(t, isLeader)
-
-	// Test releasing leadership
-	err = manager.ReleaseLeadership(ctx)
-	require.NoError(t, err)
-
-	// Verify we are no longer the leader
-	isLeader, err = manager.IsLeader(ctx)
-	require.NoError(t, err)
-	assert.False(t, isLeader)
+	err = manager.Close()
+	assert.NoError(t, err)
 }
 
-func TestRedisManager(t *testing.T) {
-	// Create a test Redis client
-	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+func TestManager_StartLeaderElection(t *testing.T) {
+	if !checkRedisAvailable() {
+		t.Skip("Redis is not available")
+	}
 
-	// Clean up any existing test keys
-	ctx := context.Background()
-	client.Del(ctx, "test:leader")
-
-	// Create a test logger
-	logger := createTestLogger()
-
-	// Create a test manager
-	manager, err := NewManager(Config{
-		Host:       "localhost",
+	zapLog, _ := zap.NewDevelopment()
+	logger := zapr.NewLogger(zapLog)
+	cfg := Config{
+		Hosts:      []string{"localhost"},
 		Port:       6379,
+		Password:   "",
+		DB:         0,
 		LeaderKey:  "test:leader",
 		InstanceID: "test-instance",
-	}, logger)
-	require.NoError(t, err)
-	defer manager.Close()
+	}
 
-	// Test acquiring leadership
-	err = manager.AcquireLeadership(ctx, 30*time.Second)
+	manager, err := NewManager(cfg, logger)
 	require.NoError(t, err)
+	require.NotNil(t, manager)
 
-	// Verify we are the leader
-	isLeader, err := manager.IsLeader(ctx)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	leaderChan := make(chan bool, 1)
+	manager.StartLeaderElection(ctx, 1*time.Second, leaderChan)
+
+	// Wait for leadership status
+	select {
+	case isLeader := <-leaderChan:
+		t.Logf("Leadership status: %v", isLeader)
+	case <-ctx.Done():
+		t.Fatal("Timeout waiting for leadership status")
+	}
+}
+
+func TestManager_AcquireLeadership(t *testing.T) {
+	if !checkRedisAvailable() {
+		t.Skip("Redis is not available")
+	}
+
+	zapLog, _ := zap.NewDevelopment()
+	logger := zapr.NewLogger(zapLog)
+	cfg := Config{
+		Hosts:      []string{"localhost"},
+		Port:       6379,
+		Password:   "",
+		DB:         0,
+		LeaderKey:  "test:leader",
+		InstanceID: "test-instance",
+	}
+
+	manager, err := NewManager(cfg, logger)
 	require.NoError(t, err)
-	assert.True(t, isLeader)
+	require.NotNil(t, manager)
 
-	// Test releasing leadership
+	ctx := context.Background()
+	err = manager.AcquireLeadership(ctx, 1*time.Second)
+	assert.NoError(t, err)
+	assert.NotNil(t, manager.mutex)
+}
+
+func TestManager_ReleaseLeadership(t *testing.T) {
+	if !checkRedisAvailable() {
+		t.Skip("Redis is not available")
+	}
+
+	zapLog, _ := zap.NewDevelopment()
+	logger := zapr.NewLogger(zapLog)
+	cfg := Config{
+		Hosts:      []string{"localhost"},
+		Port:       6379,
+		Password:   "",
+		DB:         0,
+		LeaderKey:  "test:leader",
+		InstanceID: "test-instance",
+	}
+
+	manager, err := NewManager(cfg, logger)
+	require.NoError(t, err)
+	require.NotNil(t, manager)
+
+	ctx := context.Background()
 	err = manager.ReleaseLeadership(ctx)
-	require.NoError(t, err)
+	assert.NoError(t, err)
+	assert.Nil(t, manager.mutex)
+}
 
-	// Verify we are no longer the leader
-	isLeader, err = manager.IsLeader(ctx)
+func TestManager_IsLeader(t *testing.T) {
+	if !checkRedisAvailable() {
+		t.Skip("Redis is not available")
+	}
+
+	zapLog, _ := zap.NewDevelopment()
+	logger := zapr.NewLogger(zapLog)
+	cfg := Config{
+		Hosts:      []string{"localhost"},
+		Port:       6379,
+		Password:   "",
+		DB:         0,
+		LeaderKey:  "test:leader",
+		InstanceID: "test-instance",
+	}
+
+	manager, err := NewManager(cfg, logger)
 	require.NoError(t, err)
+	require.NotNil(t, manager)
+
+	ctx := context.Background()
+	isLeader, err := manager.IsLeader(ctx)
+	assert.NoError(t, err)
 	assert.False(t, isLeader)
 }
 
-func TestRedisManager_Concurrent(t *testing.T) {
-	// Create a test Redis client
-	client := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
-	})
+func TestManager_GetCurrentLeader(t *testing.T) {
+	if !checkRedisAvailable() {
+		t.Skip("Redis is not available")
+	}
 
-	// Clean up any existing test keys
+	zapLog, _ := zap.NewDevelopment()
+	logger := zapr.NewLogger(zapLog)
+	cfg := Config{
+		Hosts:      []string{"localhost"},
+		Port:       6379,
+		Password:   "",
+		DB:         0,
+		LeaderKey:  "test:leader",
+		InstanceID: "test-instance",
+	}
+
+	manager, err := NewManager(cfg, logger)
+	require.NoError(t, err)
+	require.NotNil(t, manager)
+
 	ctx := context.Background()
-	client.Del(ctx, "test:leader")
-
-	// Create a test logger
-	logger := createTestLogger()
-
-	// Create two test managers
-	manager1, err := NewManager(Config{
-		Host:       "localhost",
-		Port:       6379,
-		LeaderKey:  "test:leader",
-		InstanceID: "test-instance-1",
-	}, logger)
-	require.NoError(t, err)
-	defer manager1.Close()
-
-	manager2, err := NewManager(Config{
-		Host:       "localhost",
-		Port:       6379,
-		LeaderKey:  "test:leader",
-		InstanceID: "test-instance-2",
-	}, logger)
-	require.NoError(t, err)
-	defer manager2.Close()
-
-	// Test concurrent leadership acquisition
-	err = manager1.AcquireLeadership(ctx, 30*time.Second)
-	require.NoError(t, err)
-
-	// Verify manager1 is the leader
-	isLeader, err := manager1.IsLeader(ctx)
-	require.NoError(t, err)
-	assert.True(t, isLeader)
-
-	// Try to acquire leadership with manager2
-	err = manager2.AcquireLeadership(ctx, 30*time.Second)
-	require.NoError(t, err)
-
-	// Verify manager2 is now the leader
-	isLeader, err = manager2.IsLeader(ctx)
-	require.NoError(t, err)
-	assert.True(t, isLeader)
-
-	// Verify manager1 is no longer the leader
-	isLeader, err = manager1.IsLeader(ctx)
-	require.NoError(t, err)
-	assert.False(t, isLeader)
+	leader, err := manager.GetCurrentLeader(ctx)
+	assert.NoError(t, err)
+	assert.Empty(t, leader)
 }

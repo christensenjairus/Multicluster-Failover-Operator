@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/redis"
 	"github.com/go-logr/logr"
@@ -17,7 +18,7 @@ import (
 
 // RedisConfig holds Redis configuration from various sources
 type RedisConfig struct {
-	Host     string
+	Hosts    []string
 	Port     int
 	Password string
 	DB       int
@@ -29,9 +30,12 @@ type RedisConfig struct {
 
 // AddFlags adds Redis-related flags to the command line
 func (c *RedisConfig) AddFlags() {
-	flag.StringVar(&c.Host, "redis-host", "localhost", "Redis host")
+	hosts := flag.String("redis-hosts", "localhost", "Comma-separated list of Redis hosts")
 	flag.IntVar(&c.Port, "redis-port", 6379, "Redis port")
 	flag.StringVar(&c.LeaderKey, "redis-leader-key", "multicluster:leader", "Redis key for leader election")
+
+	// Parse hosts string into slice
+	c.Hosts = strings.Split(*hosts, ",")
 }
 
 // LoadFromSecret loads Redis configuration from a Kubernetes secret
@@ -75,11 +79,11 @@ func (c *RedisConfig) LoadFromSecret(namespace, secretName string) error {
 	}
 
 	// Extract Redis configuration from secret
-	if host, ok := getValue("redis-host"); ok {
-		c.Host = host
-		c.logger.Info("Loaded Redis host from secret", "host", c.Host)
+	if hosts, ok := getValue("redis-hosts"); ok {
+		c.Hosts = strings.Split(hosts, ",")
+		c.logger.Info("Loaded Redis hosts from secret", "hosts", c.Hosts)
 	} else {
-		c.logger.Info("Warning: redis-host not found in secret")
+		c.logger.Info("Warning: redis-hosts not found in secret")
 	}
 	if port, ok := getValue("redis-port"); ok {
 		if portInt, err := strconv.Atoi(port); err == nil {
@@ -144,7 +148,7 @@ func getSecretKeys(secret *corev1.Secret) []string {
 // ToRedisConfig converts RedisConfig to redis.Config
 func (c *RedisConfig) ToRedisConfig() redis.Config {
 	return redis.Config{
-		Host:       c.Host,
+		Hosts:      c.Hosts,
 		Port:       c.Port,
 		Password:   c.Password,
 		DB:         c.DB,
@@ -155,8 +159,8 @@ func (c *RedisConfig) ToRedisConfig() redis.Config {
 
 // Validate validates the Redis configuration
 func (c *RedisConfig) Validate() error {
-	if c.Host == "" {
-		return fmt.Errorf("redis host is required")
+	if len(c.Hosts) == 0 {
+		return fmt.Errorf("redis hosts are required")
 	}
 	if c.Port <= 0 {
 		return fmt.Errorf("redis port must be positive")
