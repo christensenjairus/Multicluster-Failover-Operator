@@ -2,6 +2,8 @@
 
 A Kubernetes operator designed to manage failover between multiple Kubernetes clusters. This operator uses the multicluster-runtime framework to orchestrate resources across clusters for high availability.
 
+![Multicluster Failover Operator excalidraw](https://github.com/user-attachments/assets/33b95c8e-bb5a-4a9f-965e-aa52aad1a9ca)
+
 ## Overview
 
 The Multicluster Failover Operator watches `FailoverGroup` and `Failover` custom resources to manage the replication and failover of workloads between Kubernetes clusters. It's designed for scenarios where you need to maintain high availability across multiple distinct Kubernetes clusters.
