@@ -95,8 +95,8 @@ spec:
               failoverMode:
                 description: |-
                   FailoverMode defines the strategy for failover process
-                  CONSISTENCY: Prioritizes data consistency by shutting down source first (previously "Safe")
-                  UPTIME: Prioritizes service uptime by activating target before deactivating source (previously "Fast")
+                  CONSISTENCY: Prioritizes data consistency by shutting down source first
+                  UPTIME: Prioritizes service uptime by activating target before deactivating source
                 enum:
                 - CONSISTENCY
                 - UPTIME

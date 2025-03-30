@@ -65,18 +65,9 @@ type GlobalStateInfo struct {
 	// +optional
 	ActiveCluster string `json:"activeCluster,omitempty"`
 
-	// This cluster's name (for convenience)
-	// +optional
-	ThisCluster string `json:"thisCluster,omitempty"`
-
 	// Reference to the most recent failover operation
 	// +optional
 	LastFailover map[string]string `json:"lastFailover,omitempty"`
-
-	// Status of DynamoDB synchronization
-	// +kubebuilder:validation:Enum=Synced;Syncing;Error
-	// +optional
-	DBSyncStatus string `json:"dbSyncStatus,omitempty"`
 
 	// LastSyncTime is when the last successful sync with DynamoDB occurred
 	// +optional

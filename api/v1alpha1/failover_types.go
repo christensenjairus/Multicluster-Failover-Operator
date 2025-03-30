@@ -60,6 +60,17 @@ type FailoverMetrics struct {
 	TotalFailoverTimeSeconds int64 `json:"totalFailoverTimeSeconds,omitempty"`
 }
 
+// FailoverMode defines the type of failover to perform
+// +kubebuilder:validation:Enum=CONSISTENCY;UPTIME
+type FailoverMode string
+
+const (
+	// FailoverModeConsistency represents a consistency-focused failover that prioritizes data consistency
+	FailoverModeConsistency FailoverMode = "CONSISTENCY"
+	// FailoverModeUptime represents an uptime-focused failover that prioritizes service availability
+	FailoverModeUptime FailoverMode = "UPTIME"
+)
+
 // FailoverSpec defines the desired state of Failover
 type FailoverSpec struct {
 	// TargetCluster specifies which cluster should become the PRIMARY
@@ -67,11 +78,10 @@ type FailoverSpec struct {
 	TargetCluster string `json:"targetCluster"`
 
 	// FailoverMode defines the strategy for failover process
-	// CONSISTENCY: Prioritizes data consistency by shutting down source first (previously "Safe")
-	// UPTIME: Prioritizes service uptime by activating target before deactivating source (previously "Fast")
-	// +kubebuilder:validation:Enum=CONSISTENCY;UPTIME
+	// CONSISTENCY: Prioritizes data consistency by shutting down source first
+	// UPTIME: Prioritizes service uptime by activating target before deactivating source
 	// +kubebuilder:validation:Required
-	FailoverMode string `json:"failoverMode"`
+	FailoverMode FailoverMode `json:"failoverMode"`
 
 	// When true, skips safety checks like replication lag or volume sync state
 	// Use with caution - can lead to data loss if replication isn't complete

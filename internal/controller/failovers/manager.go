@@ -3,7 +3,6 @@ package failovers
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/go-logr/logr"
 	"k8s.io/client-go/tools/cache"
@@ -14,7 +13,7 @@ import (
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller/failovers/statemachine"
 	"k8s.io/apimachinery/pkg/api/errors"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
@@ -141,102 +140,129 @@ func (r *FailoverReconciler) setupWatch(ctx context.Context, cl cluster.Cluster,
 func (r *FailoverReconciler) handleFailover(ctx context.Context, cl cluster.Cluster, failover *crdv1alpha1.Failover) {
 	log := r.Log.WithValues("failover", failover.Name)
 
-	// Initialize status if needed
-	if failover.Status.Status == "" {
-		failover.Status.Status = "IN_PROGRESS"
-		failover.Status.State = "INITIALIZING"
-		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update initial status")
-			}
-			return
-		}
-	}
-
-	// Get target cluster
-	targetCluster, err := r.Provider.Get(ctx, failover.Spec.TargetCluster)
-	if err != nil {
-		log.V(2).Error(err, "Failed to get target cluster", "cluster", failover.Spec.TargetCluster)
-		failover.Status.Status = "FAILED"
-		failover.Status.Message = fmt.Sprintf("Failed to get target cluster: %v", err)
-		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update status")
-			}
-		}
-		return
-	}
-
-	// Verify we can access the target cluster's API server
-	if err := targetCluster.GetClient().Get(ctx, client.ObjectKey{Namespace: "default", Name: "kube-system"}, &corev1.Namespace{}); err != nil {
-		log.V(2).Error(err, "Failed to access target cluster API server", "cluster", failover.Spec.TargetCluster)
-		failover.Status.Status = "FAILED"
-		failover.Status.Message = fmt.Sprintf("Failed to access target cluster API server: %v", err)
-		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update status")
-			}
-		}
-		return
-	}
-
-	// Process each failover group
-	for i, group := range failover.Spec.FailoverGroups {
-		// Skip if already processed
-		if i < len(failover.Status.FailoverGroups) {
-			continue
-		}
-
-		// Initialize group status
-		group.Status = "IN_PROGRESS"
-		group.StartTime = time.Now().Format(time.RFC3339)
-		failover.Status.FailoverGroups = append(failover.Status.FailoverGroups, group)
-
-		// Update status
-		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update group status")
-			}
-			return
-		}
-
-		// TODO: Implement actual failover logic for each group
-		// This would involve:
-		// 1. Scaling down workloads in source cluster
-		// 2. Promoting volumes in target cluster (using targetCluster.GetClient())
-		// 3. Scaling up workloads in target cluster (using targetCluster.GetClient())
-		// 4. Updating network resources
-		// 5. Triggering Flux reconciliations if needed
-
-		// For now, just mark as successful
-		group.Status = "SUCCESS"
-		group.CompletionTime = time.Now().Format(time.RFC3339)
-		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update group completion status")
-			}
-			return
-		}
-	}
-
-	// Check if all groups are processed
-	allComplete := true
-	for _, group := range failover.Status.FailoverGroups {
-		if group.Status != "SUCCESS" {
-			allComplete = false
+	// Get the cluster name from the provider
+	clusterName := ""
+	for name, cluster := range r.Provider.ListClusters() {
+		if cluster == cl {
+			clusterName = name
 			break
 		}
 	}
+	if clusterName == "" {
+		log.Error(nil, "Failed to get cluster name")
+		return
+	}
 
-	if allComplete {
-		failover.Status.Status = "SUCCESS"
-		failover.Status.Message = "All failover groups processed successfully"
-		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update final status")
+	// Get the failover group to check if this is the active cluster
+	var failoverGroup crdv1alpha1.FailoverGroup
+	if err := cl.GetClient().Get(ctx, client.ObjectKey{
+		Namespace: failover.Spec.FailoverGroups[0].Namespace,
+		Name:      failover.Spec.FailoverGroups[0].Name,
+	}, &failoverGroup); err != nil {
+		log.Error(err, "Failed to get failover group")
+		return
+	}
+
+	// Only process if this is the active cluster
+	if failoverGroup.Status.GlobalState.ActiveCluster != "" && failoverGroup.Status.GlobalState.ActiveCluster != clusterName {
+		log.V(2).Info("Skipping processing - not the active cluster",
+			"activeCluster", failoverGroup.Status.GlobalState.ActiveCluster,
+			"currentCluster", clusterName)
+		return
+	}
+
+	// Initialize status if needed
+	if failover.Status.Status == "" {
+		if err := r.updateFailoverStatus(ctx, cl, failover, "IN_PROGRESS", "INITIALIZING", "Starting failover process"); err != nil {
+			return
+		}
+	}
+
+	// If the failover is already completed, don't process it again
+	if failover.Status.Status == "SUCCESS" {
+		log.Info("Failover already completed successfully, skipping processing")
+		return
+	}
+
+	// Get all clusters
+	clusters := make(map[string]client.Client)
+	for clusterName, cluster := range r.Provider.ListClusters() {
+		clusters[clusterName] = cluster.GetClient()
+	}
+
+	// Process each failover group
+	for _, groupRef := range failover.Spec.FailoverGroups {
+		// Get the failover group from the source cluster
+		var failoverGroup crdv1alpha1.FailoverGroup
+		if err := cl.GetClient().Get(ctx, client.ObjectKey{
+			Namespace: groupRef.Namespace,
+			Name:      groupRef.Name,
+		}, &failoverGroup); err != nil {
+			log.V(2).Error(err, "Failed to get failover group", "group", groupRef.Name)
+			continue
+		}
+
+		// Create and execute state machine for this failover group
+		sm := statemachine.NewStateMachine(failover, &failoverGroup, clusters, log)
+
+		// Execute state machine until completion or error
+		for {
+			if err := sm.Execute(ctx); err != nil {
+				log.V(2).Error(err, "Failed to execute state machine for failover group", "group", groupRef.Name)
+				if err := r.updateFailoverStatus(ctx, cl, failover, "FAILED", "ERROR", err.Error()); err != nil {
+					log.V(2).Error(err, "Failed to update error status")
+				}
+				break
+			}
+
+			// Check if we've reached the Complete state
+			if sm.GetCurrentState().Name() == "Complete" {
+				log.Info("State machine completed successfully", "group", groupRef.Name)
+				if err := r.updateFailoverStatus(ctx, cl, failover, "SUCCESS", "COMPLETED", "Failover completed successfully"); err != nil {
+					log.V(2).Error(err, "Failed to update success status")
+				}
+				break
 			}
 		}
 	}
+}
+
+// updateFailoverStatus updates the status of the Failover resource
+func (r *FailoverReconciler) updateFailoverStatus(ctx context.Context, cl cluster.Cluster, failover *crdv1alpha1.Failover, status, state, message string) error {
+	// Get the latest version of the failover
+	if err := cl.GetClient().Get(ctx, client.ObjectKey{
+		Namespace: failover.Namespace,
+		Name:      failover.Name,
+	}, failover); err != nil {
+		return fmt.Errorf("failed to get latest failover: %w", err)
+	}
+
+	// Update the status
+	failover.Status.Status = status
+	failover.Status.State = state
+	failover.Status.Message = message
+
+	if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
+		if !errors.IsConflict(err) {
+			return fmt.Errorf("failed to update failover status: %w", err)
+		}
+		// If there's a conflict, get the latest version and try again
+		if err := cl.GetClient().Get(ctx, client.ObjectKey{
+			Namespace: failover.Namespace,
+			Name:      failover.Name,
+		}, failover); err != nil {
+			return fmt.Errorf("failed to get latest version after conflict: %w", err)
+		}
+		// Reapply our changes
+		failover.Status.Status = status
+		failover.Status.State = state
+		failover.Status.Message = message
+		if err := cl.GetClient().Status().Update(ctx, failover); err != nil {
+			return fmt.Errorf("failed to update failover status after conflict resolution: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -249,6 +275,16 @@ func (r *FailoverReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers/status,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers/finalizers,verbs=update
+//+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+//+kubebuilder:rbac:groups=replication.storage.openshift.io,resources=volumereplications,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=replication.storage.openshift.io,resources=volumereplications/status,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=networking.istio.io,resources=virtualservices,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=kustomizations,verbs=get;list;watch;update;patch
+//+kubebuilder:rbac:groups=helm.toolkit.fluxcd.io,resources=helmreleases,verbs=get;list;watch;update;patch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.

@@ -296,13 +296,6 @@ spec:
                       - name
                       type: object
                     type: array
-                  dbSyncStatus:
-                    description: Status of DynamoDB synchronization
-                    enum:
-                    - Synced
-                    - Syncing
-                    - Error
-                    type: string
                   lastFailover:
                     additionalProperties:
                       type: string
@@ -311,9 +304,6 @@ spec:
                   lastSyncTime:
                     description: LastSyncTime is when the last successful sync with
                       DynamoDB occurred
-                    type: string
-                  thisCluster:
-                    description: This cluster's name (for convenience)
                     type: string
                 type: object
               health:

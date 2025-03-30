@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
 )
 
@@ -72,7 +73,23 @@ func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName str
 				if !errors.IsAlreadyExists(err) {
 					log.V(2).Error(err, "Failed to create mirrored object in target cluster", "targetCluster", clusterName)
 				} else {
-					log.V(2).Info("Object already exists in target cluster", "targetCluster", clusterName)
+					// If object already exists, try to update it
+					if err := targetCluster.GetClient().Get(ctx, client.ObjectKey{
+						Namespace: obj.GetNamespace(),
+						Name:      obj.GetName(),
+					}, existingObj); err != nil {
+						log.V(2).Error(err, "Failed to get existing object after AlreadyExists error", "targetCluster", clusterName)
+						continue
+					}
+					mirroredObj.SetResourceVersion(existingObj.GetResourceVersion())
+					mirroredObj.SetUID(existingObj.GetUID())
+					if err := targetCluster.GetClient().Update(ctx, mirroredObj); err != nil {
+						if !errors.IsConflict(err) {
+							log.V(2).Error(err, "Failed to update mirrored object in target cluster", "targetCluster", clusterName)
+						} else {
+							log.V(2).Info("Object was already updated by another process", "targetCluster", clusterName)
+						}
+					}
 				}
 				continue
 			}
@@ -80,14 +97,41 @@ func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName str
 			// Object exists, update it while preserving resourceVersion and UID
 			mirroredObj.SetResourceVersion(existingObj.GetResourceVersion())
 			mirroredObj.SetUID(existingObj.GetUID())
+
+			// First update the spec
 			if err := targetCluster.GetClient().Update(ctx, mirroredObj); err != nil {
-				// Ignore concurrent modification errors as they are expected in mirroring scenarios
 				if !errors.IsConflict(err) {
-					log.V(2).Error(err, "Failed to update mirrored object in target cluster", "targetCluster", clusterName)
+					log.V(2).Error(err, "Failed to update mirrored object spec in target cluster", "targetCluster", clusterName)
 				} else {
-					log.V(2).Info("Object was already updated by another process", "targetCluster", clusterName)
+					log.V(2).Info("Object spec was already updated by another process", "targetCluster", clusterName)
 				}
 				continue
+			}
+
+			// Then update the status separately, preserving the source cluster's status
+			if statusClient, ok := targetCluster.GetClient().(client.StatusClient); ok {
+				log.V(2).Info("Mirroring status update", "targetCluster", clusterName)
+				// Create a deep copy of the status to preserve source cluster's state
+				statusObj := mirroredObj.DeepCopyObject().(client.Object)
+				// Ensure we preserve the source cluster's state by copying the entire status
+				if failover, ok := statusObj.(*crdv1alpha1.Failover); ok {
+					if sourceFailover, ok := obj.(*crdv1alpha1.Failover); ok {
+						failover.Status = sourceFailover.Status
+					}
+				} else if failoverGroup, ok := statusObj.(*crdv1alpha1.FailoverGroup); ok {
+					if sourceFailoverGroup, ok := obj.(*crdv1alpha1.FailoverGroup); ok {
+						failoverGroup.Status = sourceFailoverGroup.Status
+					}
+				}
+				if err := statusClient.Status().Update(ctx, statusObj); err != nil {
+					if !errors.IsConflict(err) {
+						log.V(2).Error(err, "Failed to update mirrored object status in target cluster", "targetCluster", clusterName)
+					} else {
+						log.V(2).Info("Object status was already updated by another process", "targetCluster", clusterName)
+					}
+				}
+			} else {
+				log.V(2).Info("Target cluster client does not support status updates", "targetCluster", clusterName)
 			}
 		}
 	}
