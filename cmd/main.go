@@ -164,10 +164,6 @@ func main() {
 						}
 					}()
 
-					// Wait for manager to initialize
-					entryLog.Info("Waiting for manager to initialize...")
-					time.Sleep(10 * time.Second) // Give the manager more time to initialize
-
 					// Start provider
 					entryLog.Info("Starting provider")
 					go func() {

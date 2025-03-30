@@ -247,7 +247,7 @@ func (r *FailoverReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers/status,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to

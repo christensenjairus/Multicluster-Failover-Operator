@@ -8,7 +8,9 @@ rules:
   - crd.hahomelabs.com
   resources:
   - failovergroups
+  - failovergroups/status
   - failovers
+  - failovers/status
   verbs:
   - create
   - delete
@@ -23,13 +25,4 @@ rules:
   - failovergroups/finalizers
   - failovers/finalizers
   verbs:
-  - update
-- apiGroups:
-  - crd.hahomelabs.com
-  resources:
-  - failovergroups/status
-  - failovers/status
-  verbs:
-  - get
-  - patch
   - update

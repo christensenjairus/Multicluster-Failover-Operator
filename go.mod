@@ -5,12 +5,12 @@ go 1.23.0
 toolchain go1.24.1
 
 // Replace the external multicluster-runtime with your local code
-replace sigs.k8s.io/multicluster-runtime => github.com/christensenjairus/multicluster-runtime v0.4.0
+//replace sigs.k8s.io/multicluster-runtime => github.com/christensenjairus/multicluster-runtime v0.4.0
+replace sigs.k8s.io/multicluster-runtime => ../multicluster-runtime
 
 require (
 	github.com/go-logr/logr v1.4.2
 	github.com/go-logr/zapr v1.3.0
-	github.com/go-redis/redis v6.15.9+incompatible
 	github.com/go-redsync/redsync/v4 v4.12.1
 	github.com/onsi/ginkgo/v2 v2.22.0
 	github.com/onsi/gomega v1.36.1
@@ -53,7 +53,6 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/onsi/ginkgo v1.16.5 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/client_golang v1.19.1 // indirect

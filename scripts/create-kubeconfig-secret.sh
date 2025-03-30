@@ -94,56 +94,23 @@ if [ "$DRY_RUN" != "true" ]; then
   kubectl get namespace "$NAMESPACE" &>/dev/null || kubectl create namespace "$NAMESPACE"
 fi
 
-# Generate ServiceAccount and RoleBinding YAML
-RBAC_YAML=$(cat <<EOF
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: ${SECRET_NAME}-sa
-  namespace: ${NAMESPACE}
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: ${SECRET_NAME}-rolebinding
-  namespace: ${NAMESPACE}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: manager-role
-subjects:
-- kind: ServiceAccount
-  name: ${SECRET_NAME}-sa
-  namespace: ${NAMESPACE}
-EOF
-)
-
-# Apply RBAC rules first
 if [ "$DRY_RUN" != "true" ]; then
-  echo "Applying RBAC rules..."
-  echo "$RBAC_YAML" | kubectl apply -f -
-  
-  # Wait for service account to be created and get its token
-  echo "Waiting for service account to be created..."
-  sleep 2  # Give the API server time to create the service account
-  
-  # Get the cluster CA certificate
-  CLUSTER_CA=$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[].cluster.certificate-authority-data}')
+  # Get the cluster CA certificate from the remote cluster
+  CLUSTER_CA=$(kubectl --context=${KUBECONFIG_CONTEXT} config view --raw --minify --flatten -o jsonpath='{.clusters[].cluster.certificate-authority-data}')
   if [ -z "$CLUSTER_CA" ]; then
     echo "ERROR: Could not get cluster CA certificate"
     exit 1
   fi
   
-  # Get the cluster server URL
-  CLUSTER_SERVER=$(kubectl config view --raw --minify --flatten -o jsonpath='{.clusters[].cluster.server}')
+  # Get the cluster server URL from the remote cluster
+  CLUSTER_SERVER=$(kubectl --context=${KUBECONFIG_CONTEXT} config view --raw --minify --flatten -o jsonpath='{.clusters[].cluster.server}')
   if [ -z "$CLUSTER_SERVER" ]; then
     echo "ERROR: Could not get cluster server URL"
     exit 1
   fi
   
-  # Get the service account token
-  SA_TOKEN=$(kubectl -n ${NAMESPACE} create token ${SECRET_NAME}-sa --duration=8760h)
+  # Get the service account token from the remote cluster
+  SA_TOKEN=$(kubectl --context=${KUBECONFIG_CONTEXT} -n ${NAMESPACE} create token multicluster-failover-operator-controller-manager --duration=8760h)
   if [ -z "$SA_TOKEN" ]; then
     echo "ERROR: Could not create service account token"
     exit 1
@@ -162,10 +129,10 @@ contexts:
 - name: ${SECRET_NAME}
   context:
     cluster: ${SECRET_NAME}
-    user: ${SECRET_NAME}-sa
+    user: multicluster-failover-operator-controller-manager
 current-context: ${SECRET_NAME}
 users:
-- name: ${SECRET_NAME}-sa
+- name: multicluster-failover-operator-controller-manager
   user:
     token: ${SA_TOKEN}
 EOF
@@ -200,7 +167,6 @@ EOF
   echo "$SECRET_YAML" | kubectl apply -f -
   
   echo "Secret '${SECRET_NAME}' created in namespace '${NAMESPACE}'"
-  echo "RBAC rules created for service account '${SECRET_NAME}-sa'"
   
   if [ "$VERIFY" == "true" ]; then
     echo "Verifying setup..."
@@ -211,31 +177,9 @@ EOF
       exit 1
     fi
     
-    # Check if service account exists
-    if ! kubectl get serviceaccount "${SECRET_NAME}-sa" -n "${NAMESPACE}" &>/dev/null; then
-      echo "ERROR: Service account ${SECRET_NAME}-sa not found in namespace ${NAMESPACE}"
-      exit 1
-    fi
-    
-    # Check if role binding exists
-    if ! kubectl get rolebinding "${SECRET_NAME}-rolebinding" -n "${NAMESPACE}" &>/dev/null; then
-      echo "ERROR: Role binding ${SECRET_NAME}-rolebinding not found in namespace ${NAMESPACE}"
-      exit 1
-    fi
-    
-    # Verify the token works
-    echo "Verifying token permissions..."
-    if ! kubectl --token="${SA_TOKEN}" get failovergroups -A &>/dev/null; then
-      echo "ERROR: Service account token does not have required permissions"
-      exit 1
-    fi
-    
     echo "Setup verified successfully!"
   fi
 else
-  echo "# RBAC YAML that would be applied:"
-  echo "$RBAC_YAML"
-  echo ""
   echo "# Example of the kubeconfig that would be created (with redacted values):"
   echo "apiVersion: v1"
   echo "kind: Config"
@@ -248,10 +192,10 @@ else
   echo "- name: ${SECRET_NAME}"
   echo "  context:"
   echo "    cluster: ${SECRET_NAME}"
-  echo "    user: ${SECRET_NAME}-sa"
+  echo "    user: multicluster-failover-operator-controller-manager"
   echo "current-context: ${SECRET_NAME}"
   echo "users:"
-  echo "- name: ${SECRET_NAME}-sa"
+  echo "- name: multicluster-failover-operator-controller-manager"
   echo "  user:"
   echo "    token: <service-account-token>"
 fi
