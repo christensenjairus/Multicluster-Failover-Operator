@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script to create a kubeconfig secret and RBAC rules for the Multicluster Failover Operator
+# Script to create a kubeconfig secret for the Multicluster Failover Operator
 
 set -e
 
@@ -16,16 +16,16 @@ OUTPUT_FILE=""
 # Function to display usage information
 function show_help {
   echo "Usage: $0 [options]"
-  echo "  -n, --name NAME         Name for the secret (will be used as cluster identifier)"
+  echo "  -c, --context CONTEXT   Kubeconfig context to use (required)"
+  echo "  -n, --name NAME         Name for the secret (defaults to context name)"
   echo "  -s, --namespace NS      Namespace to create the secret in (default: ${NAMESPACE})"
   echo "  -k, --kubeconfig PATH   Path to kubeconfig file (default: ${KUBECONFIG_PATH})"
-  echo "  -c, --context CONTEXT   Kubeconfig context to use (default: current-context)"
   echo "  -d, --dry-run           Dry run, print YAML but don't apply"
   echo "  --no-verify             Skip verification step"
   echo "  -o, --output FILE       Save the generated kubeconfig to a file"
   echo "  -h, --help              Show this help message"
   echo ""
-  echo "Example: $0 -n cluster1 -c prod-cluster -k ~/.kube/config"
+  echo "Example: $0 -c prod-cluster -k ~/.kube/config"
 }
 
 # Parse command line options
@@ -73,10 +73,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate required arguments
-if [ -z "$SECRET_NAME" ]; then
-  echo "ERROR: Secret name is required (-n, --name)"
+if [ -z "$KUBECONFIG_CONTEXT" ]; then
+  echo "ERROR: Kubeconfig context is required (-c, --context)"
   show_help
   exit 1
+fi
+
+# Set secret name to context if not specified
+if [ -z "$SECRET_NAME" ]; then
+  SECRET_NAME="$KUBECONFIG_CONTEXT"
 fi
 
 if [ ! -f "$KUBECONFIG_PATH" ]; then
@@ -89,7 +94,7 @@ if [ "$DRY_RUN" != "true" ]; then
   kubectl get namespace "$NAMESPACE" &>/dev/null || kubectl create namespace "$NAMESPACE"
 fi
 
-# Generate RBAC YAML
+# Generate ServiceAccount and RoleBinding YAML
 RBAC_YAML=$(cat <<EOF
 ---
 apiVersion: v1
@@ -99,48 +104,14 @@ metadata:
   namespace: ${NAMESPACE}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: ${SECRET_NAME}-role
-rules:
-- apiGroups:
-  - crd.hahomelabs.com
-  resources:
-  - failovergroups
-  - failovers
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - crd.hahomelabs.com
-  resources:
-  - failovergroups/finalizers
-  - failovers/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - crd.hahomelabs.com
-  resources:
-  - failovergroups/status
-  - failovers/status
-  verbs:
-  - get
-  - patch
-  - update
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: ${SECRET_NAME}-rolebinding
+  namespace: ${NAMESPACE}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: ${SECRET_NAME}-role
+  name: manager-role
 subjects:
 - kind: ServiceAccount
   name: ${SECRET_NAME}-sa
@@ -246,15 +217,9 @@ EOF
       exit 1
     fi
     
-    # Check if cluster role exists
-    if ! kubectl get clusterrole "${SECRET_NAME}-role" &>/dev/null; then
-      echo "ERROR: Cluster role ${SECRET_NAME}-role not found"
-      exit 1
-    fi
-    
-    # Check if cluster role binding exists
-    if ! kubectl get clusterrolebinding "${SECRET_NAME}-rolebinding" &>/dev/null; then
-      echo "ERROR: Cluster role binding ${SECRET_NAME}-rolebinding not found"
+    # Check if role binding exists
+    if ! kubectl get rolebinding "${SECRET_NAME}-rolebinding" -n "${NAMESPACE}" &>/dev/null; then
+      echo "ERROR: Role binding ${SECRET_NAME}-rolebinding not found in namespace ${NAMESPACE}"
       exit 1
     fi
     
