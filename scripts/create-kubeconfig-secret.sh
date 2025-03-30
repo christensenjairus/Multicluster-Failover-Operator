@@ -1,21 +1,23 @@
 #!/bin/bash
 
-# Script to create a kubeconfig secret for the Multicluster Failover Operator
+# Script to create a kubeconfig secret for the pod lister controller
 
 set -e
 
 # Default values
 NAMESPACE="multicluster-failover-operator-system"
+SERVICE_ACCOUNT="multicluster-failover-operator-controller-manager"
 KUBECONFIG_CONTEXT=""
 SECRET_NAME=""
 
 # Function to display usage information
 function show_help {
   echo "Usage: $0 [options]"
-  echo "  -c, --context CONTEXT   Kubeconfig context to use (required)"
-  echo "  -n, --name NAME         Name for the secret (defaults to context name)"
-  echo "  -s, --namespace NS      Namespace to create the secret in (default: ${NAMESPACE})"
-  echo "  -h, --help              Show this help message"
+  echo "  -c, --context CONTEXT    Kubeconfig context to use (required)"
+  echo "  --name NAME              Name for the secret (defaults to context name)"
+  echo "  -n, --namespace NS       Namespace to create the secret in (default: ${NAMESPACE})"
+  echo "  -a, --service-account SA Service account name to use (default: ${SERVICE_ACCOUNT})"
+  echo "  -h, --help               Show this help message"
   echo ""
   echo "Example: $0 -c prod-cluster"
 }
@@ -24,16 +26,20 @@ function show_help {
 while [[ $# -gt 0 ]]; do
   key="$1"
   case $key in
-    -n|--name)
+    --name)
       SECRET_NAME="$2"
       shift 2
       ;;
-    -s|--namespace)
+    -n|--namespace)
       NAMESPACE="$2"
       shift 2
       ;;
     -c|--context)
       KUBECONFIG_CONTEXT="$2"
+      shift 2
+      ;;
+    -a|--service-account)
+      SERVICE_ACCOUNT="$2"
       shift 2
       ;;
     -h|--help)
@@ -75,7 +81,7 @@ if [ -z "$CLUSTER_SERVER" ]; then
 fi
 
 # Get the service account token from the remote cluster
-SA_TOKEN=$(kubectl --context=${KUBECONFIG_CONTEXT} -n ${NAMESPACE} create token multicluster-failover-operator-controller-manager --duration=8760h)
+SA_TOKEN=$(kubectl --context=${KUBECONFIG_CONTEXT} -n ${NAMESPACE} create token ${SERVICE_ACCOUNT} --duration=8760h)
 if [ -z "$SA_TOKEN" ]; then
   echo "ERROR: Could not create service account token"
   exit 1
@@ -94,17 +100,34 @@ contexts:
 - name: ${SECRET_NAME}
   context:
     cluster: ${SECRET_NAME}
-    user: multicluster-failover-operator-controller-manager
+    user: ${SERVICE_ACCOUNT}
 current-context: ${SECRET_NAME}
 users:
-- name: multicluster-failover-operator-controller-manager
+- name: ${SERVICE_ACCOUNT}
   user:
     token: ${SA_TOKEN}
 EOF
 )
 
-# Encode the new kubeconfig
-KUBECONFIG_B64=$(echo "$NEW_KUBECONFIG" | base64 -w0)
+# Save kubeconfig temporarily for testing
+TEMP_KUBECONFIG=$(mktemp)
+echo "$NEW_KUBECONFIG" > "$TEMP_KUBECONFIG"
+
+# Verify the kubeconfig works
+echo "Verifying kubeconfig..."
+if ! kubectl --kubeconfig="$TEMP_KUBECONFIG" get failovergroups,failovers -A &>/dev/null; then
+  rm "$TEMP_KUBECONFIG"
+  echo "ERROR: Failed to verify kubeconfig - unable to list failovergroups or failovers."
+  echo "- Ensure that the service account '${NAMESPACE}/${SERVICE_ACCOUNT}' on cluster '${KUBECONFIG_CONTEXT}' has the necessary permissions to list failovergroups and failovers."
+  echo "- You may specify a namespace using the -n flag."
+  echo "- You may specify a service account using the -a flag."
+  exit 1
+fi
+echo "Kubeconfig verified successfully!"
+
+# Encode the verified kubeconfig
+KUBECONFIG_B64=$(cat "$TEMP_KUBECONFIG" | base64 -w0)
+rm "$TEMP_KUBECONFIG"
 
 # Generate and apply the secret
 SECRET_YAML=$(cat <<EOF
@@ -125,13 +148,4 @@ echo "Creating kubeconfig secret..."
 echo "$SECRET_YAML" | kubectl apply -f -
 
 echo "Secret '${SECRET_NAME}' created in namespace '${NAMESPACE}'"
-
-# Verify the secret works
-echo "Verifying kubeconfig..."
-if ! kubectl --context=${KUBECONFIG_CONTEXT} get failovergroups -A &>/dev/null; then
-  echo "ERROR: Failed to verify kubeconfig - unable to list failovergroups"
-  exit 1
-fi
-echo "Kubeconfig verified successfully!"
-
 echo "The operator should now be able to discover and connect to this cluster" 
