@@ -6,8 +6,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
@@ -15,6 +13,34 @@ import (
 
 // NewStateMachine creates a new state machine
 func NewStateMachine(failover *crdv1alpha1.Failover, failoverGroup *crdv1alpha1.FailoverGroup, clusters map[string]client.Client, log logr.Logger) *StateMachine {
+	// Get the current cluster name by finding the cluster that has the failover
+	var currentCluster string
+	for clusterName, clusterClient := range clusters {
+		// Try to get the failover from this cluster
+		err := clusterClient.Get(context.Background(), client.ObjectKey{
+			Namespace: failover.Namespace,
+			Name:      failover.Name,
+		}, &crdv1alpha1.Failover{})
+
+		if err == nil {
+			currentCluster = clusterName
+			break
+		}
+	}
+
+	if currentCluster == "" {
+		log.Error(fmt.Errorf("could not determine current cluster"), "failed to determine current cluster")
+		return nil
+	}
+
+	// Check if this cluster is the source of truth
+	if currentCluster != failover.Spec.TargetCluster {
+		log.V(2).Info("Skipping state machine - not the source of truth cluster",
+			"currentCluster", currentCluster,
+			"sourceCluster", failover.Spec.TargetCluster)
+		return nil
+	}
+
 	sm := &StateMachine{
 		states: make(map[string]State),
 		log:    log,
@@ -58,6 +84,10 @@ func (sm *StateMachine) registerStates() {
 
 // Execute runs the state machine
 func (sm *StateMachine) Execute(ctx context.Context) error {
+	if sm == nil {
+		return fmt.Errorf("state machine is nil")
+	}
+
 	if sm.currentState == nil {
 		return fmt.Errorf("no current state")
 	}
@@ -95,50 +125,6 @@ func (sm *StateMachine) Execute(ctx context.Context) error {
 	}
 
 	sm.currentState = nextState
-	return nil
-}
-
-// updateFailoverStatus updates the status of the Failover resource
-func (sm *StateMachine) updateFailoverStatus(ctx context.Context, status string) error {
-	// Get the client for the active cluster
-	activeCluster := sm.context.FailoverGroup.Status.GlobalState.ActiveCluster
-	activeClient, exists := sm.context.Clusters[activeCluster]
-	if !exists {
-		return fmt.Errorf("active cluster %s not found", activeCluster)
-	}
-
-	// Get the failover resource
-	failover := &crdv1alpha1.Failover{}
-	if err := activeClient.Get(ctx, types.NamespacedName{
-		Namespace: sm.context.Failover.Namespace,
-		Name:      sm.context.Failover.Name,
-	}, failover); err != nil {
-		if !errors.IsNotFound(err) {
-			return fmt.Errorf("failed to get failover: %w", err)
-		}
-		return fmt.Errorf("failover not found")
-	}
-
-	// Update the status
-	failover.Status.State = status
-	if err := activeClient.Status().Update(ctx, failover); err != nil {
-		if !errors.IsConflict(err) {
-			return fmt.Errorf("failed to update failover status: %w", err)
-		}
-		// If there's a conflict, get the latest version and try again
-		if err := activeClient.Get(ctx, types.NamespacedName{
-			Namespace: failover.Namespace,
-			Name:      failover.Name,
-		}, failover); err != nil {
-			return fmt.Errorf("failed to get latest version after conflict: %w", err)
-		}
-		// Reapply our changes
-		failover.Status.State = status
-		if err := activeClient.Status().Update(ctx, failover); err != nil {
-			return fmt.Errorf("failed to update failover status after conflict resolution: %w", err)
-		}
-	}
-
 	return nil
 }
 

@@ -72,7 +72,6 @@ type FailoverContext struct {
 // StateMachine manages the failover workflow
 type StateMachine struct {
 	states       map[string]State
-	initialState State
 	currentState State
 	context      *FailoverContext
 	log          logr.Logger

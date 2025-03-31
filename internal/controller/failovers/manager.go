@@ -204,6 +204,10 @@ func (r *FailoverReconciler) handleFailover(ctx context.Context, cl cluster.Clus
 
 		// Create and execute state machine for this failover group
 		sm := statemachine.NewStateMachine(failover, &failoverGroup, clusters, log)
+		if sm == nil {
+			log.V(2).Info("State machine not created - skipping execution", "group", groupRef.Name)
+			continue
+		}
 
 		// Execute state machine until completion or error
 		for {

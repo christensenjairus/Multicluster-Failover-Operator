@@ -29,7 +29,9 @@ func NewResourceMirror(provider *kubeconfigprovider.Provider) *ResourceMirror {
 	}
 }
 
-// MirrorObject mirrors an object to all other clusters
+// MirrorObject mirrors an object from the source cluster to all other clusters.
+// If the object doesn't exist in the source cluster, it will allow bi-directional sync
+// to discover the object from other clusters.
 func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName string, obj client.Object) error {
 	log := m.Log.WithValues(
 		"kind", obj.GetObjectKind().GroupVersionKind().Kind,
@@ -41,13 +43,82 @@ func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName str
 	// Get all clusters
 	clusters := m.Provider.ListClusters()
 
-	// Create a deep copy of the object
-	mirroredObj := obj.DeepCopyObject().(client.Object)
+	// Determine the actual source of truth based on the resource type
+	actualSourceCluster := sourceClusterName
+	switch obj.(type) {
+	case *crdv1alpha1.FailoverGroup:
+		// For FailoverGroup, use the active cluster as source of truth
+		if failoverGroup, ok := obj.(*crdv1alpha1.FailoverGroup); ok {
+			if failoverGroup.Status.GlobalState.ActiveCluster != "" {
+				actualSourceCluster = failoverGroup.Status.GlobalState.ActiveCluster
+				log.V(2).Info("Using active cluster as source of truth", "activeCluster", actualSourceCluster)
+			}
+		}
+	case *crdv1alpha1.Failover:
+		// For Failover, use the target cluster as source of truth
+		if failover, ok := obj.(*crdv1alpha1.Failover); ok {
+			actualSourceCluster = failover.Spec.TargetCluster
+			log.V(2).Info("Using target cluster as source of truth", "targetCluster", actualSourceCluster)
+		}
+	}
+
+	// First check if the object exists in the source cluster
+	sourceCluster, exists := clusters[actualSourceCluster]
+	if !exists {
+		return fmt.Errorf("source cluster %s not found", actualSourceCluster)
+	}
+
+	// Check if object exists in source cluster
+	sourceObj := obj.DeepCopyObject().(client.Object)
+	err := sourceCluster.GetClient().Get(ctx, client.ObjectKey{
+		Namespace: obj.GetNamespace(),
+		Name:      obj.GetName(),
+	}, sourceObj)
+
+	// If object doesn't exist in source cluster, try to find it in other clusters
+	if err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			return fmt.Errorf("failed to check if object exists in source cluster: %w", err)
+		}
+
+		// Object doesn't exist in source cluster, try to find it in other clusters
+		log.Info("Object not found in source cluster, attempting to discover from other clusters")
+		for clusterName, targetCluster := range clusters {
+			if clusterName == actualSourceCluster {
+				continue
+			}
+
+			discoveredObj := obj.DeepCopyObject().(client.Object)
+			err := targetCluster.GetClient().Get(ctx, client.ObjectKey{
+				Namespace: obj.GetNamespace(),
+				Name:      obj.GetName(),
+			}, discoveredObj)
+
+			if err == nil {
+				// Found the object in another cluster, create it in source cluster
+				log.Info("Found object in cluster, creating in source cluster", "discoveryCluster", clusterName)
+				discoveredObj.SetUID("")
+				discoveredObj.SetResourceVersion("")
+				if err := sourceCluster.GetClient().Create(ctx, discoveredObj); err != nil {
+					if !errors.IsAlreadyExists(err) {
+						log.Error(err, "Failed to create discovered object in source cluster")
+						continue
+					}
+				}
+				// Now that we've created it in the source cluster, proceed with normal one-way sync
+				sourceObj = discoveredObj
+				break
+			}
+		}
+	}
+
+	// Create a deep copy of the object for mirroring
+	mirroredObj := sourceObj.DeepCopyObject().(client.Object)
 
 	// Mirror to each cluster
 	for clusterName, targetCluster := range clusters {
 		// Skip the source cluster
-		if clusterName == sourceClusterName {
+		if clusterName == actualSourceCluster {
 			continue
 		}
 
@@ -72,24 +143,6 @@ func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName str
 			if err := targetCluster.GetClient().Create(ctx, mirroredObj); err != nil {
 				if !errors.IsAlreadyExists(err) {
 					log.V(2).Error(err, "Failed to create mirrored object in target cluster", "targetCluster", clusterName)
-				} else {
-					// If object already exists, try to update it
-					if err := targetCluster.GetClient().Get(ctx, client.ObjectKey{
-						Namespace: obj.GetNamespace(),
-						Name:      obj.GetName(),
-					}, existingObj); err != nil {
-						log.V(2).Error(err, "Failed to get existing object after AlreadyExists error", "targetCluster", clusterName)
-						continue
-					}
-					mirroredObj.SetResourceVersion(existingObj.GetResourceVersion())
-					mirroredObj.SetUID(existingObj.GetUID())
-					if err := targetCluster.GetClient().Update(ctx, mirroredObj); err != nil {
-						if !errors.IsConflict(err) {
-							log.V(2).Error(err, "Failed to update mirrored object in target cluster", "targetCluster", clusterName)
-						} else {
-							log.V(2).Info("Object was already updated by another process", "targetCluster", clusterName)
-						}
-					}
 				}
 				continue
 			}
@@ -98,7 +151,7 @@ func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName str
 			mirroredObj.SetResourceVersion(existingObj.GetResourceVersion())
 			mirroredObj.SetUID(existingObj.GetUID())
 
-			// First update the spec
+			// Update the spec
 			if err := targetCluster.GetClient().Update(ctx, mirroredObj); err != nil {
 				if !errors.IsConflict(err) {
 					log.V(2).Error(err, "Failed to update mirrored object spec in target cluster", "targetCluster", clusterName)
@@ -108,18 +161,18 @@ func (m *ResourceMirror) MirrorObject(ctx context.Context, sourceClusterName str
 				continue
 			}
 
-			// Then update the status separately, preserving the source cluster's status
+			// Update the status separately, preserving the source cluster's status
 			if statusClient, ok := targetCluster.GetClient().(client.StatusClient); ok {
 				log.V(2).Info("Mirroring status update", "targetCluster", clusterName)
 				// Create a deep copy of the status to preserve source cluster's state
 				statusObj := mirroredObj.DeepCopyObject().(client.Object)
 				// Ensure we preserve the source cluster's state by copying the entire status
 				if failover, ok := statusObj.(*crdv1alpha1.Failover); ok {
-					if sourceFailover, ok := obj.(*crdv1alpha1.Failover); ok {
+					if sourceFailover, ok := sourceObj.(*crdv1alpha1.Failover); ok {
 						failover.Status = sourceFailover.Status
 					}
 				} else if failoverGroup, ok := statusObj.(*crdv1alpha1.FailoverGroup); ok {
-					if sourceFailoverGroup, ok := obj.(*crdv1alpha1.FailoverGroup); ok {
+					if sourceFailoverGroup, ok := sourceObj.(*crdv1alpha1.FailoverGroup); ok {
 						failoverGroup.Status = sourceFailoverGroup.Status
 					}
 				}
