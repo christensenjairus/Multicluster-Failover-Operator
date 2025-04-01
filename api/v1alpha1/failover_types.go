@@ -49,17 +49,6 @@ type FailoverGroupReference struct {
 	Message string `json:"message,omitempty"`
 }
 
-// FailoverMetrics contains metrics related to the failover operation
-type FailoverMetrics struct {
-	// TotalDowntimeSeconds is the total application downtime during failover
-	// +optional
-	TotalDowntimeSeconds int64 `json:"totalDowntimeSeconds,omitempty"`
-
-	// TotalFailoverTimeSeconds is the total time taken to complete the failover
-	// +optional
-	TotalFailoverTimeSeconds int64 `json:"totalFailoverTimeSeconds,omitempty"`
-}
-
 // FailoverMode defines the type of failover to perform
 // +kubebuilder:validation:Enum=CONSISTENCY;UPTIME
 type FailoverMode string
@@ -83,7 +72,7 @@ type FailoverSpec struct {
 	// +kubebuilder:validation:Required
 	FailoverMode FailoverMode `json:"failoverMode"`
 
-	// When true, skips safety checks like replication lag or volume sync state
+	// When true, skips safety checks like replication lag or volume sync state, and does not roll back automatically. Used in cases of emergency failover.
 	// Use with caution - can lead to data loss if replication isn't complete
 	// +optional
 	// +kubebuilder:default=false
@@ -98,18 +87,6 @@ type FailoverSpec struct {
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinItems=1
 	FailoverGroups []FailoverGroupReference `json:"failoverGroups"`
-}
-
-// For backward compatibility with existing specs
-// +k8s:conversion-gen=false
-// +k8s:conversion-gen-external-types=github.com/christensenjairus/Failover-Operator/api/v1alpha1
-// This helps API compatibility during transition
-type LegacyFailoverSpec struct {
-	// When true, overrides component failoverMode settings to use 'fast' mode
-	// Fast mode starts the new cluster first before stopping the old one
-	// This minimizes downtime but may cause brief data inconsistency
-	// +optional
-	ForceFastMode bool `json:"forceFastMode,omitempty"`
 }
 
 // FailoverStatus defines the observed state of Failover
@@ -130,10 +107,6 @@ type FailoverStatus struct {
 	// FailoverGroups contains status information for each FailoverGroup
 	// +optional
 	FailoverGroups []FailoverGroupReference `json:"failoverGroups,omitempty"`
-
-	// Metrics contains metrics related to the failover operation
-	// +optional
-	Metrics FailoverMetrics `json:"metrics,omitempty"`
 
 	// Conditions represent the current state of the failover operation
 	// +optional

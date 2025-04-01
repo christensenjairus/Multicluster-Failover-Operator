@@ -20,71 +20,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TimeoutSettings defines configurable timeouts for failover operations
-type TimeoutSettings struct {
-	// Maximum time a FailoverGroup can remain in FAILOVER/FAILBACK states
-	// After this period, the operator initiates an automatic rollback
-	// +optional
-	TransitoryState string `json:"transitoryState,omitempty"`
-
-	// Time that a PRIMARY cluster can remain unhealthy before auto-failover
-	// The operator creates a failover after this period if health status=ERROR
-	// +optional
-	UnhealthyPrimary string `json:"unhealthyPrimary,omitempty"`
-
-	// Time without heartbeats before assuming a cluster is down
-	// The operator creates a failover after this period if no heartbeats are received
-	// +optional
-	Heartbeat string `json:"heartbeat,omitempty"`
-}
-
-// ClusterInfo contains information about a cluster in the FailoverGroup
-type ClusterInfo struct {
-	// Name of the cluster
-	// +kubebuilder:validation:Required
-	Name string `json:"name"`
-
-	// Role of the cluster (PRIMARY or STANDBY)
-	// +kubebuilder:validation:Enum=PRIMARY;STANDBY
-	// +optional
-	Role string `json:"role,omitempty"`
-
-	// Health status of the cluster
-	// +kubebuilder:validation:Enum=OK;DEGRADED;ERROR;UNKNOWN
-	// +optional
-	Health string `json:"health,omitempty"`
-
-	// LastHeartbeat is the timestamp of the last heartbeat received
-	// +optional
-	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
-}
-
-// GlobalStateInfo contains global state information synced from DynamoDB
-type GlobalStateInfo struct {
-	// Which cluster is currently PRIMARY for this group
-	// +optional
-	ActiveCluster string `json:"activeCluster,omitempty"`
-
-	// Reference to the most recent failover operation
-	// +optional
-	LastFailover map[string]string `json:"lastFailover,omitempty"`
-
-	// LastSyncTime is when the last successful sync with DynamoDB occurred
-	// +optional
-	LastSyncTime string `json:"lastSyncTime,omitempty"`
-
-	// Information about all clusters participating in this FailoverGroup
-	// +optional
-	Clusters []ClusterInfo `json:"clusters,omitempty"`
-}
-
-// VolumeReplication defines a volume replication specification
-type VolumeReplicationSpec struct {
-	// Name of the PVC or volume claim
-	// +kubebuilder:validation:Required
-	Name string `json:"name"`
-}
-
 // WorkloadSpec defines a workload resource
 type WorkloadSpec struct {
 	// Kind of the workload resource
@@ -141,15 +76,6 @@ type FailoverGroupSpec struct {
 	// +kubebuilder:default=false
 	Suspended bool `json:"suspended"`
 
-	// Documentation field explaining why automatic failovers are suspended
-	// Only meaningful when suspended=true
-	// +optional
-	SuspensionReason string `json:"suspensionReason,omitempty"`
-
-	// Timeout settings for automatic operations
-	// +optional
-	Timeouts TimeoutSettings `json:"timeouts,omitempty"`
-
 	// How often the operator updates heartbeats in DynamoDB
 	// This controls the frequency of cluster health updates in the global state
 	// +optional
@@ -162,114 +88,30 @@ type FailoverGroupSpec struct {
 	// Network resources that just need annotation flips during failover
 	// +optional
 	NetworkResources []NetworkResourceSpec `json:"networkResources,omitempty"`
+
 	// Flux resources to manage during failover
 	// +optional
 	FluxResources []FluxResourceSpec `json:"fluxResources,omitempty"`
 }
 
-// WorkloadStatus defines the status of a workload
-type WorkloadStatus struct {
-	// Kind of the workload resource
-	Kind string `json:"kind"`
-
-	// Name of the workload resource
-	Name string `json:"name"`
-
-	// Health indicates the health status of the workload
-	// Values: "OK", "DEGRADED", "ERROR"
-	// +kubebuilder:validation:Enum=OK;DEGRADED;ERROR
-	Health string `json:"health"`
-
-	// Status provides additional details about the workload status
-	// +optional
-	Status string `json:"status,omitempty"`
-
-	// VolumeReplications contains the status of volume replications associated with this workload
-	// +optional
-	VolumeReplications []VolumeReplicationStatus `json:"volumeReplications,omitempty"`
-}
-
-// VolumeReplicationStatus defines the status of a volume replication
-type VolumeReplicationStatus struct {
-	// Name of the volume replication
-	Name string `json:"name"`
-
-	// Health indicates the replication health status
-	// Values: "OK", "DEGRADED", "ERROR"
-	// +kubebuilder:validation:Enum=OK;DEGRADED;ERROR
-	Health string `json:"health"`
-
-	// Status provides additional details about the replication status
-	// +optional
-	Status string `json:"status,omitempty"`
-}
-
-// NetworkResourceStatus defines the status of a network resource
-type NetworkResourceStatus struct {
-	// Kind of the network resource
-	Kind string `json:"kind"`
-
-	// Name of the network resource
-	Name string `json:"name"`
-
-	// Health indicates the health status of the network resource
-	// Values: "OK", "DEGRADED", "ERROR"
-	// +kubebuilder:validation:Enum=OK;DEGRADED;ERROR
-	Health string `json:"health"`
-
-	// Status provides additional details about the network resource status
-	// +optional
-	Status string `json:"status,omitempty"`
-}
-
-// FluxResourceStatus defines the status of a Flux GitOps resource
-type FluxResourceStatus struct {
-	// Kind of the Flux resource
-	Kind string `json:"kind"`
-
-	// Name of the Flux resource
-	Name string `json:"name"`
-
-	// Health indicates the health status of the Flux resource
-	// Values: "OK", "DEGRADED", "ERROR"
-	// +kubebuilder:validation:Enum=OK;DEGRADED;ERROR
-	Health string `json:"health"`
-
-	// Status provides additional details about the Flux resource status
-	// +optional
-	Status string `json:"status,omitempty"`
-}
-
 // FailoverGroupStatus defines the observed state of FailoverGroup
 type FailoverGroupStatus struct {
-	// Health indicates the overall health of the failover group
-	// Values: "OK", "DEGRADED", "ERROR"
-	// +kubebuilder:validation:Enum=OK;DEGRADED;ERROR
+	// Which cluster is currently PRIMARY for this group
+	// +optional
+	ActiveCluster string `json:"activeCluster,omitempty"`
+
+	// Reference to the most recent failover operation
+	// +optional
+	LastFailover map[string]string `json:"lastFailover,omitempty"`
+
+	// Health status of the active cluster
+	// +kubebuilder:validation:Enum=OK;DEGRADED;ERROR;UNKNOWN
+	// +optional
 	Health string `json:"health,omitempty"`
 
-	// Suspended indicates if the failover group is currently suspended
-	// This directly reflects the spec.suspended field and is shown in status for easier visibility
-	Suspended bool `json:"suspended"`
-
-	// Workloads contains status information for each workload defined in the spec
+	// LastHeartbeat is the timestamp of the last heartbeat received
 	// +optional
-	Workloads []WorkloadStatus `json:"workloads,omitempty"`
-
-	// NetworkResources contains status information for each network resource defined in the spec
-	// +optional
-	NetworkResources []NetworkResourceStatus `json:"networkResources,omitempty"`
-
-	// FluxResources contains status information for each Flux resource defined in the spec
-	// +optional
-	FluxResources []FluxResourceStatus `json:"fluxResources,omitempty"`
-
-	// LastFailoverTime is the time when the last failover operation completed
-	// +optional
-	LastFailoverTime string `json:"lastFailoverTime,omitempty"`
-
-	// GlobalState contains global state information synced from DynamoDB
-	// +optional
-	GlobalState GlobalStateInfo `json:"globalState,omitempty"`
+	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
 
 	// Conditions represent the current state of failover reconciliation.
 	// +optional
@@ -279,8 +121,8 @@ type FailoverGroupStatus struct {
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
 //+kubebuilder:printcolumn:name="Health",type=string,JSONPath=`.status.health`
-//+kubebuilder:printcolumn:name="Suspended",type=boolean,JSONPath=`.status.suspended`
-//+kubebuilder:printcolumn:name="Active",type=string,JSONPath=`.status.globalState.activeCluster`
+//+kubebuilder:printcolumn:name="Suspended",type=boolean,JSONPath=`.spec.suspended`
+//+kubebuilder:printcolumn:name="Active Cluster",type=string,JSONPath=`.status.activeCluster`
 //+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // FailoverGroup is the Schema for the failovergroups API

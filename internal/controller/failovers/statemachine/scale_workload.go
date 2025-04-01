@@ -39,9 +39,9 @@ func (s *ScaleWorkloadState) Execute(ctx context.Context, data *FailoverContext)
 	s.log.Info("Executing workload scaling")
 
 	// Get the cluster client
-	clusterClient, exists := s.clusters[s.failoverGroup.Status.GlobalState.ActiveCluster]
+	clusterClient, exists := s.clusters[s.failoverGroup.Status.ActiveCluster]
 	if !exists {
-		return nil, fmt.Errorf("active cluster %s not found", s.failoverGroup.Status.GlobalState.ActiveCluster)
+		return nil, fmt.Errorf("active cluster %s not found", s.failoverGroup.Status.ActiveCluster)
 	}
 
 	// Create managers

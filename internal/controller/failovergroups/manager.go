@@ -12,8 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
-	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller"
-	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/mirror"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/constants"
 	"k8s.io/apimachinery/pkg/api/errors"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
@@ -25,7 +24,6 @@ type FailoverGroupReconciler struct {
 	Manager  mcmanager.Manager
 	Provider *kubeconfigprovider.Provider
 	Log      logr.Logger
-	Mirror   *mirror.ResourceMirror
 }
 
 // NewFailoverGroupReconciler creates a new FailoverGroupReconciler
@@ -34,7 +32,6 @@ func NewFailoverGroupReconciler(mgr mcmanager.Manager) *FailoverGroupReconciler 
 		Manager:  mgr,
 		Provider: mgr.GetProvider().(*kubeconfigprovider.Provider),
 		Log:      log.FromContext(context.Background()).WithName("failovergroup-reconciler"),
-		Mirror:   mirror.NewResourceMirror(mgr.GetProvider().(*kubeconfigprovider.Provider)),
 	}
 }
 
@@ -82,12 +79,6 @@ func (r *FailoverGroupReconciler) setupWatch(ctx context.Context, cl cluster.Clu
 		log.Info("Failover group",
 			"name", group.Name,
 			"health", group.Status.Health)
-	}
-
-	// Set up mirroring for FailoverGroups
-	if err := controller.SetupResourceMirroring(ctx, r.Provider, cl, clusterName, &crdv1alpha1.FailoverGroup{}); err != nil {
-		log.Error(err, "Failed to set up resource mirroring")
-		return err
 	}
 
 	// Get the informer for failover groups
@@ -155,10 +146,24 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 		return
 	}
 
-	// Only process if this is the active cluster
-	if failoverGroup.Status.GlobalState.ActiveCluster != "" && failoverGroup.Status.GlobalState.ActiveCluster != clusterName {
-		log.V(2).Info("Skipping processing - not the active cluster",
-			"activeCluster", failoverGroup.Status.GlobalState.ActiveCluster,
+	// Check if this is a new FailoverGroup (no sot cluster annotation)
+	if failoverGroup.Annotations == nil || failoverGroup.Annotations[constants.SotClusterAnnotation] == "" {
+		// This is a new FailoverGroup, set the sot cluster annotation
+		if failoverGroup.Annotations == nil {
+			failoverGroup.Annotations = make(map[string]string)
+		}
+		failoverGroup.Annotations[constants.SotClusterAnnotation] = clusterName
+		if err := cl.GetClient().Update(ctx, failoverGroup); err != nil {
+			log.Error(err, "Failed to set sot cluster annotation")
+			return
+		}
+		log.Info("Set sot cluster annotation", "cluster", clusterName)
+	}
+
+	// Only process if this is the source of truth cluster
+	if sotCluster := failoverGroup.Annotations[constants.SotClusterAnnotation]; sotCluster != clusterName {
+		log.V(2).Info("Skipping processing - not the source of truth cluster",
+			"sotCluster", sotCluster,
 			"currentCluster", clusterName)
 		return
 	}
@@ -166,21 +171,14 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 	// Initialize status if needed
 	if failoverGroup.Status.Health == "" {
 		failoverGroup.Status.Health = "OK"
-		failoverGroup.Status.Suspended = failoverGroup.Spec.Suspended
+		failoverGroup.Status.LastHeartbeat = time.Now().Format(time.RFC3339)
 
 		// Set the active cluster to the cluster where the failover group is first created
-		if failoverGroup.Status.GlobalState.ActiveCluster == "" {
-			failoverGroup.Status.GlobalState.ActiveCluster = clusterName
-			failoverGroup.Status.GlobalState.Clusters = []crdv1alpha1.ClusterInfo{
-				{
-					Name:   clusterName,
-					Role:   "PRIMARY",
-					Health: "UNKNOWN",
-				},
-			}
+		if failoverGroup.Status.ActiveCluster == "" {
+			failoverGroup.Status.ActiveCluster = clusterName
 		}
 
-		// Update the status on the active cluster
+		// Update the status
 		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
 			if !errors.IsConflict(err) {
 				log.V(2).Error(err, "Failed to update initial status")
@@ -196,174 +194,32 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 			}
 			// Reapply our changes
 			failoverGroup.Status.Health = "OK"
-			failoverGroup.Status.Suspended = failoverGroup.Spec.Suspended
-			if failoverGroup.Status.GlobalState.ActiveCluster == "" {
-				failoverGroup.Status.GlobalState.ActiveCluster = clusterName
-				failoverGroup.Status.GlobalState.Clusters = []crdv1alpha1.ClusterInfo{
-					{
-						Name:   clusterName,
-						Role:   "PRIMARY",
-						Health: "OK",
-					},
-				}
+			failoverGroup.Status.LastHeartbeat = time.Now().Format(time.RFC3339)
+			if failoverGroup.Status.ActiveCluster == "" {
+				failoverGroup.Status.ActiveCluster = clusterName
 			}
 			if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
 				log.V(2).Error(err, "Failed to update initial status after conflict resolution")
 				return
 			}
 		}
-
-		// Only mirror after successful update
-		// Create a deep copy for mirroring to preserve the source cluster's state
-		mirrorObj := failoverGroup.DeepCopy()
-		if err := r.Mirror.MirrorObject(ctx, clusterName, mirrorObj); err != nil {
-			log.V(2).Error(err, "Failed to mirror initial status")
-		}
 	}
 
-	// Update suspended status if changed
-	if failoverGroup.Status.Suspended != failoverGroup.Spec.Suspended {
-		failoverGroup.Status.Suspended = failoverGroup.Spec.Suspended
-		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update suspended status")
-			}
-			return
-		}
-		// Mirror the status update to other clusters
-		if err := r.Mirror.MirrorObject(ctx, clusterName, failoverGroup); err != nil {
-			log.V(2).Error(err, "Failed to mirror suspended status")
-		}
-	}
-
-	// Process workloads
-	for i, workload := range failoverGroup.Spec.Workloads {
-		// Skip if already processed
-		if i < len(failoverGroup.Status.Workloads) {
-			continue
-		}
-
-		// Initialize workload status
-		workloadStatus := crdv1alpha1.WorkloadStatus{
-			Kind:   workload.Kind,
-			Name:   workload.Name,
-			Health: "OK",
-		}
-		failoverGroup.Status.Workloads = append(failoverGroup.Status.Workloads, workloadStatus)
-
-		// Update status
-		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update workload status", "workload", workload.Name)
-			}
-			return
-		}
-		// Mirror the status update to other clusters
-		if err := r.Mirror.MirrorObject(ctx, clusterName, failoverGroup); err != nil {
-			log.V(2).Error(err, "Failed to mirror workload status", "workload", workload.Name)
-		}
-
-		// TODO: Implement actual workload health check
+	// Update heartbeat if needed
+	if failoverGroup.Spec.HeartbeatInterval != "" {
+		// TODO: Implement heartbeat interval check and update
 		// This would involve:
-		// 1. Checking pod status
-		// 2. Checking volume replication status
-		// 3. Checking Flux reconciliation status
-	}
-
-	// Process network resources
-	for i, resource := range failoverGroup.Spec.NetworkResources {
-		// Skip if already processed
-		if i < len(failoverGroup.Status.NetworkResources) {
-			continue
-		}
-
-		// Initialize network resource status
-		resourceStatus := crdv1alpha1.NetworkResourceStatus{
-			Kind:   resource.Kind,
-			Name:   resource.Name,
-			Health: "OK",
-		}
-		failoverGroup.Status.NetworkResources = append(failoverGroup.Status.NetworkResources, resourceStatus)
-
-		// Update status
-		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update network resource status", "resource", resource.Name)
-			}
-			return
-		}
-		// Mirror the status update to other clusters
-		if err := r.Mirror.MirrorObject(ctx, clusterName, failoverGroup); err != nil {
-			log.V(2).Error(err, "Failed to mirror network resource status", "resource", resource.Name)
-		}
-
-		// TODO: Implement actual network resource health check
-		// This would involve:
-		// 1. Checking resource existence
-		// 2. Checking resource configuration
-	}
-
-	// Process Flux resources
-	for i, resource := range failoverGroup.Spec.FluxResources {
-		// Skip if already processed
-		if i < len(failoverGroup.Status.FluxResources) {
-			continue
-		}
-
-		// Initialize Flux resource status
-		resourceStatus := crdv1alpha1.FluxResourceStatus{
-			Kind:   resource.Kind,
-			Name:   resource.Name,
-			Health: "OK",
-		}
-		failoverGroup.Status.FluxResources = append(failoverGroup.Status.FluxResources, resourceStatus)
-
-		// Update status
-		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update Flux resource status", "resource", resource.Name)
-			}
-			return
-		}
-		// Mirror the status update to other clusters
-		if err := r.Mirror.MirrorObject(ctx, clusterName, failoverGroup); err != nil {
-			log.V(2).Error(err, "Failed to mirror Flux resource status", "resource", resource.Name)
-		}
-
-		// TODO: Implement actual Flux resource health check
-		// This would involve:
-		// 1. Checking resource existence
-		// 2. Checking reconciliation status
-	}
-
-	// Update global state
-	if failoverGroup.Status.GlobalState.ActiveCluster == "" {
-		// TODO: Implement actual global state sync
-		// This would involve:
-		// 1. Syncing with DynamoDB
-		// 2. Updating cluster health status
-		// 3. Updating active cluster information
-		failoverGroup.Status.GlobalState.LastSyncTime = time.Now().Format(time.RFC3339)
-		if err := cl.GetClient().Status().Update(ctx, failoverGroup); err != nil {
-			if !errors.IsConflict(err) {
-				log.V(2).Error(err, "Failed to update global state")
-			}
-			return
-		}
-		// Mirror the status update to other clusters
-		if err := r.Mirror.MirrorObject(ctx, clusterName, failoverGroup); err != nil {
-			log.V(2).Error(err, "Failed to mirror global state")
-		}
+		// 1. Parsing the heartbeat interval
+		// 2. Checking if enough time has passed
+		// 3. Updating LastHeartbeat if needed
 	}
 
 	// Check overall health
-	allHealthy := true
-	for _, workload := range failoverGroup.Status.Workloads {
-		if workload.Health != "OK" {
-			allHealthy = false
-			break
-		}
-	}
+	// TODO: Implement actual health checks for:
+	// 1. Workloads
+	// 2. Network resources
+	// 3. Flux resources
+	allHealthy := true // Placeholder until actual health checks are implemented
 
 	if allHealthy {
 		failoverGroup.Status.Health = "OK"
@@ -375,10 +231,6 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 		if !errors.IsConflict(err) {
 			log.V(2).Error(err, "Failed to update overall health status")
 		}
-	}
-	// Mirror the final status update to other clusters
-	if err := r.Mirror.MirrorObject(ctx, clusterName, failoverGroup); err != nil {
-		log.V(2).Error(err, "Failed to mirror final health status")
 	}
 }
 

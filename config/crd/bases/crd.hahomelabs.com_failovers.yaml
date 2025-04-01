@@ -104,7 +104,7 @@ spec:
               force:
                 default: false
                 description: |-
-                  When true, skips safety checks like replication lag or volume sync state
+                  When true, skips safety checks like replication lag or volume sync state, and does not roll back automatically. Used in cases of emergency failover.
                   Use with caution - can lead to data loss if replication isn't complete
                 type: boolean
               reason:
@@ -224,20 +224,6 @@ spec:
                 description: Message provides additional details about the overall
                   failover operation
                 type: string
-              metrics:
-                description: Metrics contains metrics related to the failover operation
-                properties:
-                  totalDowntimeSeconds:
-                    description: TotalDowntimeSeconds is the total application downtime
-                      during failover
-                    format: int64
-                    type: integer
-                  totalFailoverTimeSeconds:
-                    description: TotalFailoverTimeSeconds is the total time taken
-                      to complete the failover
-                    format: int64
-                    type: integer
-                type: object
               state:
                 description: |-
                   State reflects the current phase of the failover workflow

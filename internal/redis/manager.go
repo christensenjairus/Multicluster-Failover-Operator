@@ -137,7 +137,7 @@ func (m *Manager) StartLeaderElection(ctx context.Context, ttl time.Duration, le
 						leaderChan <- false
 						continue
 					}
-					m.logger.Info("Successfully extended leadership")
+					//m.logger.Info("Successfully extended leadership")
 					// Don't send true here - we're already the leader
 				} else {
 					// We're not the leader, try to acquire leadership
