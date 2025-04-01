@@ -66,6 +66,11 @@ type FailoverSpec struct {
 	// +kubebuilder:validation:Required
 	TargetCluster string `json:"targetCluster"`
 
+	// SourceOfTruthCluster specifies which cluster is the source of truth for this resource
+	// This cluster's state will be considered authoritative for spec changes
+	// +kubebuilder:validation:Required
+	SourceOfTruthCluster string `json:"sourceOfTruthCluster"`
+
 	// FailoverMode defines the strategy for failover process
 	// CONSISTENCY: Prioritizes data consistency by shutting down source first
 	// UPTIME: Prioritizes service uptime by activating target before deactivating source
@@ -118,6 +123,7 @@ type FailoverStatus struct {
 //+kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.status`
 //+kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`
 //+kubebuilder:printcolumn:name="Target",type=string,JSONPath=`.spec.targetCluster`
+//+kubebuilder:printcolumn:name="SOT",type=string,JSONPath=`.spec.sourceOfTruthCluster`
 //+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 //+kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || oldSelf.spec.targetCluster == self.spec.targetCluster",message="targetCluster is immutable"
 //+kubebuilder:validation:XValidation:rule="!has(oldSelf.spec) || oldSelf.spec.failoverMode == self.spec.failoverMode",message="failoverMode is immutable"

@@ -13,7 +13,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
-	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/constants"
 	"k8s.io/apimachinery/pkg/api/errors"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
@@ -147,24 +146,21 @@ func (r *FailoverReconciler) handleFailover(ctx context.Context, cl cluster.Clus
 		return
 	}
 
-	// Check if this is a new Failover (no sot cluster annotation)
-	if failover.Annotations == nil || failover.Annotations[constants.SotClusterAnnotation] == "" {
-		// This is a new Failover, set the sot cluster annotation
-		if failover.Annotations == nil {
-			failover.Annotations = make(map[string]string)
-		}
-		failover.Annotations[constants.SotClusterAnnotation] = clusterName
+	// Check if this is a new Failover (no source of truth cluster set)
+	if failover.Spec.SourceOfTruthCluster == "" {
+		// This is a new Failover, set the source of truth cluster
+		failover.Spec.SourceOfTruthCluster = clusterName
 		if err := cl.GetClient().Update(ctx, failover); err != nil {
-			log.Error(err, "Failed to set sot cluster annotation")
+			log.Error(err, "Failed to set source of truth cluster")
 			return
 		}
-		log.Info("Set sot cluster annotation", "cluster", clusterName)
+		log.Info("Set source of truth cluster", "cluster", clusterName)
 	}
 
 	// Only process if this is the source of truth cluster
-	if sotCluster := failover.Annotations[constants.SotClusterAnnotation]; sotCluster != clusterName {
+	if failover.Spec.SourceOfTruthCluster != clusterName {
 		log.V(2).Info("Skipping processing - not the source of truth cluster",
-			"sotCluster", sotCluster,
+			"sotCluster", failover.Spec.SourceOfTruthCluster,
 			"currentCluster", clusterName)
 		return
 	}
@@ -273,7 +269,6 @@ func (r *FailoverReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers/status,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovers/finalizers,verbs=update
 //+kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 //+kubebuilder:rbac:groups=replication.storage.openshift.io,resources=volumereplications,verbs=get;list;watch;update;patch
 //+kubebuilder:rbac:groups=replication.storage.openshift.io,resources=volumereplications/status,verbs=get;list;watch;update;patch

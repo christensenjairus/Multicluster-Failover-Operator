@@ -37,6 +37,7 @@ import (
 	internalconfig "github.com/christensenjairus/Multicluster-Failover-Operator/internal/config"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller/failovergroups"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller/failovers"
+	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/controller/mirror"
 	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/redis"
 
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -135,6 +136,11 @@ func main() {
 	failoverController := failovers.NewFailoverReconciler(mgr)
 	if err := mgr.Add(failoverController); err != nil {
 		entryLog.Error(err, "Unable to add failover controller")
+		os.Exit(1)
+	}
+	mirrorController := mirror.NewMirrorReconciler(mgr)
+	if err := mgr.Add(mirrorController); err != nil {
+		entryLog.Error(err, "Unable to add mirror controller")
 		os.Exit(1)
 	}
 

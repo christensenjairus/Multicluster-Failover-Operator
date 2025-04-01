@@ -24,6 +24,9 @@ spec:
     - jsonPath: .spec.targetCluster
       name: Target
       type: string
+    - jsonPath: .spec.sourceOfTruthCluster
+      name: SOT
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -112,6 +115,11 @@ spec:
                   Optional documentation field explaining the reason for this failover
                   Not used by controller logic but useful for auditing and tracking
                 type: string
+              sourceOfTruthCluster:
+                description: |-
+                  SourceOfTruthCluster specifies which cluster is the source of truth for this resource
+                  This cluster's state will be considered authoritative for spec changes
+                type: string
               targetCluster:
                 description: TargetCluster specifies which cluster should become the
                   PRIMARY
@@ -119,6 +127,7 @@ spec:
             required:
             - failoverGroups
             - failoverMode
+            - sourceOfTruthCluster
             - targetCluster
             type: object
           status:

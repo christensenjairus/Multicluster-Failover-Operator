@@ -66,6 +66,11 @@ type FluxResourceSpec struct {
 
 // FailoverGroupSpec defines the desired state of FailoverGroup
 type FailoverGroupSpec struct {
+	// SourceOfTruthCluster specifies which cluster is the source of truth for this resource
+	// This cluster's state will be considered authoritative for spec changes
+	// +kubebuilder:validation:Required
+	SourceOfTruthCluster string `json:"sourceOfTruthCluster"`
+
 	// Identifier for the operator instance that should process this FailoverGroup
 	// This allows running multiple operator instances for different applications
 	// +optional
@@ -122,7 +127,8 @@ type FailoverGroupStatus struct {
 //+kubebuilder:subresource:status
 //+kubebuilder:printcolumn:name="Health",type=string,JSONPath=`.status.health`
 //+kubebuilder:printcolumn:name="Suspended",type=boolean,JSONPath=`.spec.suspended`
-//+kubebuilder:printcolumn:name="Active Cluster",type=string,JSONPath=`.status.activeCluster`
+//+kubebuilder:printcolumn:name="Active",type=string,JSONPath=`.status.activeCluster`
+//+kubebuilder:printcolumn:name="SOT",type=string,JSONPath=`.spec.sourceOfTruthCluster`
 //+kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // FailoverGroup is the Schema for the failovergroups API

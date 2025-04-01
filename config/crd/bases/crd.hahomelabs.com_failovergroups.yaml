@@ -22,7 +22,10 @@ spec:
       name: Suspended
       type: boolean
     - jsonPath: .status.activeCluster
-      name: Active Cluster
+      name: Active
+      type: string
+    - jsonPath: .spec.sourceOfTruthCluster
+      name: SOT
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
@@ -105,6 +108,11 @@ spec:
                   Identifier for the operator instance that should process this FailoverGroup
                   This allows running multiple operator instances for different applications
                 type: string
+              sourceOfTruthCluster:
+                description: |-
+                  SourceOfTruthCluster specifies which cluster is the source of truth for this resource
+                  This cluster's state will be considered authoritative for spec changes
+                type: string
               suspended:
                 default: false
                 description: |-
@@ -139,6 +147,7 @@ spec:
                   type: object
                 type: array
             required:
+            - sourceOfTruthCluster
             - suspended
             type: object
           status:

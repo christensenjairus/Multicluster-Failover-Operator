@@ -12,7 +12,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	crdv1alpha1 "github.com/christensenjairus/Multicluster-Failover-Operator/api/v1alpha1"
-	"github.com/christensenjairus/Multicluster-Failover-Operator/internal/constants"
 	"k8s.io/apimachinery/pkg/api/errors"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
@@ -146,24 +145,21 @@ func (r *FailoverGroupReconciler) handleFailoverGroup(ctx context.Context, cl cl
 		return
 	}
 
-	// Check if this is a new FailoverGroup (no sot cluster annotation)
-	if failoverGroup.Annotations == nil || failoverGroup.Annotations[constants.SotClusterAnnotation] == "" {
-		// This is a new FailoverGroup, set the sot cluster annotation
-		if failoverGroup.Annotations == nil {
-			failoverGroup.Annotations = make(map[string]string)
-		}
-		failoverGroup.Annotations[constants.SotClusterAnnotation] = clusterName
+	// Check if this is a new FailoverGroup (no source of truth cluster set)
+	if failoverGroup.Spec.SourceOfTruthCluster == "" {
+		// This is a new FailoverGroup, set the source of truth cluster
+		failoverGroup.Spec.SourceOfTruthCluster = clusterName
 		if err := cl.GetClient().Update(ctx, failoverGroup); err != nil {
-			log.Error(err, "Failed to set sot cluster annotation")
+			log.Error(err, "Failed to set source of truth cluster")
 			return
 		}
-		log.Info("Set sot cluster annotation", "cluster", clusterName)
+		log.Info("Set source of truth cluster", "cluster", clusterName)
 	}
 
 	// Only process if this is the source of truth cluster
-	if sotCluster := failoverGroup.Annotations[constants.SotClusterAnnotation]; sotCluster != clusterName {
+	if failoverGroup.Spec.SourceOfTruthCluster != clusterName {
 		log.V(2).Info("Skipping processing - not the source of truth cluster",
-			"sotCluster", sotCluster,
+			"sotCluster", failoverGroup.Spec.SourceOfTruthCluster,
 			"currentCluster", clusterName)
 		return
 	}
@@ -243,7 +239,6 @@ func (r *FailoverGroupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovergroups,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovergroups/status,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=crd.hahomelabs.com,resources=failovergroups/finalizers,verbs=update
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
